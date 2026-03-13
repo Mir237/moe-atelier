@@ -896,17 +896,13 @@ h1, h2, h3, h4, h5, h6, .ant-typography {
 
 .sticky-note-textarea {
   background: transparent !important;
-  /* 缩小字号和整体行距 */
   line-height: 28px !important;
   font-size: 13px !important;
   color: #665555 !important;
-  /* 取消背景，将虚线背景移到外层容器以便全局排满 */
   border: none !important;
   box-shadow: none !important;
   resize: vertical !important;
-  /* 调整 paddingTop 以配合新的 line-height，确保顶部文字可见 */
-  padding: 28px 24px 28px 24px !important; 
-  /* 确保输入框可以正常滚动 */
+  padding: 28px 24px 28px 24px !important;
   overflow-y: auto !important;
   position: relative;
   z-index: 1;
@@ -923,13 +919,11 @@ h1, h2, h3, h4, h5, h6, .ant-typography {
   line-height: 28px !important;
 }
 
-/* 更好的实现方式：让包含输入框的容器向上滚动，然后瞬间回到下方继续向上滚动到原位 */
 .sticky-note-inner-wrap {
   position: relative;
   width: 100%;
   height: 100%;
-  /* 将背景移到这里，并去掉 content-box 让它铺满，同时通过 padding 控制两侧留白，或者用 margin 控制。
-     这里使用绝对定位的伪元素来绘制虚线背景，方便控制留白和高度，且保证向下滚动时虚线能连贯填满空页面 */
+  --sticky-note-scroll-top: 0px;
 }
 
 .sticky-note-bg-layer {
@@ -938,16 +932,17 @@ h1, h2, h3, h4, h5, h6, .ant-typography {
   bottom: -2800px;
   left: 24px;
   right: 24px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='28'%3E%3Cpath d='M0 22.5 L8 22.5' stroke='%23C4D4CC' stroke-width='1.5' fill='none'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='28' viewBox='0 0 12 28'%3E%3Cpath d='M0 22.5 L8 22.5' stroke='%23C4D4CC' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
   background-size: 12px 28px;
   background-repeat: repeat;
-  z-index: 0;
+  background-position: 0 27px;
   pointer-events: none;
+  z-index: 0;
+  transform: translateY(calc(-1 * var(--sticky-note-scroll-top)));
 }
 
 
 .sticky-note-inner-wrap.rolling {
-  /* 改为向下转，移除 opacity 渐变防止虚线消失 */
   animation: conveyor-roll-wrap-down 1.2s forwards;
 }
 
@@ -957,11 +952,9 @@ h1, h2, h3, h4, h5, h6, .ant-typography {
     animation-timing-function: cubic-bezier(0.4, 0, 1, 1);
   }
   49.999% {
-    /* 这里的 150% 控制向下滚动的距离，150% 意味着空页面长度大约是文本的 0.5 倍。 */
     transform: translateY(150%);
   }
   50% {
-    /* 瞬间回到上方对应的距离，需和上面的距离保持一致的负数 */
     transform: translateY(-150%);
     animation-timing-function: cubic-bezier(0, 0, 0.2, 1);
   }

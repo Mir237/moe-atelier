@@ -3,6 +3,7 @@ import {
   Input, Button, Upload, message, Spin, Image, 
   Space, Typography, Tooltip, Popover, InputNumber, Select
 } from 'antd';
+import type { TextAreaRef } from 'antd/es/input/TextArea';
 import { 
   UploadOutlined, DeleteFilled, ReloadOutlined, 
   BellFilled, BellOutlined, DownloadOutlined, PictureFilled,
@@ -181,6 +182,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const [prompt, setPrompt] = useState('');
   const promptRef = useRef(prompt);
   const promptFocusedRef = useRef(false);
+  const promptTextareaRef = useRef<TextAreaRef | null>(null);
+  const stickyNoteWrapRef = useRef<HTMLDivElement | null>(null);
   const [fileList, setFileList] = useState<UploadFileWithMeta[]>([]);
   const fileListRef = useRef<UploadFileWithMeta[]>(fileList);
   const [concurrency, setConcurrency] = useState<number>(DEFAULT_CONCURRENCY);
@@ -553,6 +556,15 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   }, [prompt]);
 
   useEffect(() => {
+    const frameId = window.requestAnimationFrame(() => {
+      syncStickyNoteScroll();
+    });
+    return () => {
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [prompt, hydrated]);
+
+  useEffect(() => {
     fileListRef.current = fileList;
   }, [fileList]);
 
@@ -738,6 +750,13 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     promptRef.current = value;
     setPrompt(value);
   };
+
+  function syncStickyNoteScroll() {
+    const wrap = stickyNoteWrapRef.current;
+    const textarea = promptTextareaRef.current?.resizableTextArea?.textArea;
+    if (!wrap || !textarea) return;
+    wrap.style.setProperty('--sticky-note-scroll-top', `${textarea.scrollTop}px`);
+  }
 
   const handlePromptFocus = () => {
     promptFocusedRef.current = true;
@@ -2233,20 +2252,25 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
           {/* 独立便签输入框 */}
           <div className="sticky-note-container">
             <div className="sticky-note-fold-effect top" />
-            <div className={`sticky-note-inner-wrap ${isGlobalLoading ? 'rolling' : ''}`} onAnimationEnd={(e) => {
-              if (e.animationName === 'conveyor-roll-wrap-down') {
-                e.currentTarget.classList.remove('rolling');
-              }
-            }}>
-              {/* 背景虚线层通过 CSS top/bottom 扩展，这里不需要再动态计算高度，让它自然延伸 */}
+            <div
+              ref={stickyNoteWrapRef}
+              className={`sticky-note-inner-wrap ${isGlobalLoading ? 'rolling' : ''}`}
+              onAnimationEnd={(e) => {
+                if (e.animationName === 'conveyor-roll-wrap-down') {
+                  e.currentTarget.classList.remove('rolling');
+                }
+              }}
+            >
               <div className="sticky-note-bg-layer" />
               <TextArea 
+                ref={promptTextareaRef}
                 className="sticky-note-textarea"
                 placeholder="在此描述您的想象..." 
                 value={prompt} 
                 onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => handlePromptChange(e.target.value)}
                 onFocus={handlePromptFocus}
                 onBlur={handlePromptBlur}
+                onScroll={syncStickyNoteScroll}
                 onPaste={handlePromptPaste}
                 autoSize={{ minRows: 2, maxRows: 15 }}
                 variant="borderless"
