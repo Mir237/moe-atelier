@@ -145,11 +145,36 @@ export const clampNumber = (value, min, max, fallback) => {
 export const normalizeConcurrency = (value, fallback = DEFAULT_CONCURRENCY) =>
   clampNumber(value, MIN_CONCURRENCY, MAX_CONCURRENCY, fallback)
 
+export const DEFAULT_TASK_RETRY_INTERVAL = 1000
+export const DEFAULT_TASK_RETRY_LIMIT = -1
+
+export const normalizeRetryInterval = (
+  value,
+  fallback = DEFAULT_TASK_RETRY_INTERVAL,
+) => {
+  if (typeof value !== 'number' || Number.isNaN(value) || !Number.isFinite(value)) {
+    return fallback
+  }
+  return Math.max(0, value)
+}
+
+export const normalizeRetryLimit = (
+  value,
+  fallback = DEFAULT_TASK_RETRY_LIMIT,
+) => {
+  if (typeof value !== 'number' || Number.isNaN(value) || !Number.isFinite(value)) {
+    return fallback
+  }
+  return Math.floor(Math.max(DEFAULT_TASK_RETRY_LIMIT, value))
+}
+
 export const createDefaultTaskState = () => ({
   version: 1,
   prompt: '',
   concurrency: DEFAULT_CONCURRENCY,
   enableSound: true,
+  retryInterval: DEFAULT_TASK_RETRY_INTERVAL,
+  retryLimit: DEFAULT_TASK_RETRY_LIMIT,
   results: [],
   uploads: [],
   stats: { ...DEFAULT_TASK_STATS },
@@ -217,6 +242,8 @@ export const loadTaskState = async (taskId) => {
     ...createDefaultTaskState(),
     ...data,
     concurrency: normalizeConcurrency(data?.concurrency),
+    retryInterval: normalizeRetryInterval(data?.retryInterval),
+    retryLimit: normalizeRetryLimit(data?.retryLimit),
     stats: { ...DEFAULT_TASK_STATS, ...(data?.stats || {}) },
     results: Array.isArray(data?.results) ? data.results : [],
     uploads: Array.isArray(data?.uploads) ? data.uploads : [],

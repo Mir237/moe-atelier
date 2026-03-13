@@ -130,7 +130,7 @@ export const useInputGuard = ({ isEditing, idleMs }: InputGuardOptions = {}) => 
   }, [idleMs, clearIdleTimer]);
 
   const shouldPreserve = useCallback(
-    (incoming?: string, current?: string) => {
+    (incoming?: unknown, current?: unknown) => {
       if (isEditing?.()) return true;
       if (!dirtyRef.current) return false;
       if (incoming !== undefined && current !== undefined) {

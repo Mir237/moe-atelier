@@ -191,6 +191,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const [enableSound, setEnableSound] = useState<boolean>(true);
   const [retryInterval, setRetryInterval] = useState<number>(1000);
   const [retryLimit, setRetryLimit] = useState<number>(-1);
+  const retryIntervalRef = useRef(retryInterval);
+  const retryLimitRef = useRef(retryLimit);
   const [apiProfileId, setApiProfileId] = useState<string>('default');
   
   const [results, setResults] = useState<SubTaskResult[]>([]);
@@ -223,6 +225,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     currentResultsRef.current = results;
   }, [results]);
   const promptGuard = useInputGuard({ isEditing: () => promptFocusedRef.current });
+  const retryIntervalGuard = useInputGuard();
+  const retryLimitGuard = useInputGuard();
   const backendPayload = React.useMemo(() => {
     if (!backendMode || !hydrated) return null;
     return {
@@ -250,6 +254,16 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     clearDirty: clearPromptDirty,
     shouldPreserve: shouldPreservePromptInput,
   } = promptGuard;
+  const {
+    markDirty: markRetryIntervalDirty,
+    clearDirty: clearRetryIntervalDirty,
+    shouldPreserve: shouldPreserveRetryIntervalInput,
+  } = retryIntervalGuard;
+  const {
+    markDirty: markRetryLimitDirty,
+    clearDirty: clearRetryLimitDirty,
+    shouldPreserve: shouldPreserveRetryLimitInput,
+  } = retryLimitGuard;
   const { markSynced: markTaskSynced } = taskSync;
 
   const withBackendToken = (url: string) => {
@@ -351,6 +365,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   ) => {
     const nextPrompt = stored.prompt ?? '';
     const currentPrompt = promptRef.current;
+    const currentRetryInterval = retryIntervalRef.current;
+    const currentRetryLimit = retryLimitRef.current;
     const shouldPreservePrompt =
       options.preservePrompt ||
       shouldPreservePromptInput(nextPrompt, currentPrompt);
@@ -358,6 +374,10 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     const nextEnableSound = typeof stored.enableSound === 'boolean' ? stored.enableSound : true;
     const nextRetryInterval = typeof stored.retryInterval === 'number' ? stored.retryInterval : 1000;
     const nextRetryLimit = typeof stored.retryLimit === 'number' ? stored.retryLimit : -1;
+    const shouldPreserveRetryInterval =
+      shouldPreserveRetryIntervalInput(nextRetryInterval, currentRetryInterval);
+    const shouldPreserveRetryLimit =
+      shouldPreserveRetryLimitInput(nextRetryLimit, currentRetryLimit);
     const nextApiProfileId = stored.apiProfileId || config.activeApiProfileId || 'default';
     const storedUploads = Array.isArray(stored.uploads) ? stored.uploads : [];
     markTaskSynced({
@@ -382,8 +402,20 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     setConcurrency(nextConcurrency);
     setConcurrencyInput(String(nextConcurrency));
     setEnableSound(nextEnableSound);
-    setRetryInterval(nextRetryInterval);
-    setRetryLimit(nextRetryLimit);
+    if (!shouldPreserveRetryInterval) {
+      retryIntervalRef.current = nextRetryInterval;
+      clearRetryIntervalDirty();
+      setRetryInterval(nextRetryInterval);
+    } else if (nextRetryInterval === currentRetryInterval) {
+      clearRetryIntervalDirty();
+    }
+    if (!shouldPreserveRetryLimit) {
+      retryLimitRef.current = nextRetryLimit;
+      clearRetryLimitDirty();
+      setRetryLimit(nextRetryLimit);
+    } else if (nextRetryLimit === currentRetryLimit) {
+      clearRetryLimitDirty();
+    }
     setStats({ ...DEFAULT_TASK_STATS, ...(stored.stats || {}) });
 
     const storedResults = Array.isArray(stored.results) ? stored.results : [];
@@ -554,6 +586,14 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   useEffect(() => {
     promptRef.current = prompt;
   }, [prompt]);
+
+  useEffect(() => {
+    retryIntervalRef.current = retryInterval;
+  }, [retryInterval]);
+
+  useEffect(() => {
+    retryLimitRef.current = retryLimit;
+  }, [retryLimit]);
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
@@ -749,6 +789,20 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     markPromptDirty();
     promptRef.current = value;
     setPrompt(value);
+  };
+
+  const handleRetryIntervalChange = (value: number | null) => {
+    const nextRetryInterval = Math.max(0, value || 0) * 1000;
+    markRetryIntervalDirty();
+    retryIntervalRef.current = nextRetryInterval;
+    setRetryInterval(nextRetryInterval);
+  };
+
+  const handleRetryLimitChange = (value: number | null) => {
+    const nextRetryLimit = typeof value === 'number' ? Math.max(-1, Math.floor(value)) : -1;
+    markRetryLimitDirty();
+    retryLimitRef.current = nextRetryLimit;
+    setRetryLimit(nextRetryLimit);
   };
 
   function syncStickyNoteScroll() {
@@ -2390,7 +2444,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                         step={0.1}
                         bordered={false}
                         value={retryInterval / 1000} 
-                        onChange={(val) => setRetryInterval(Math.max(0, val || 0) * 1000)} 
+                        onChange={handleRetryIntervalChange} 
                         style={{ width: 60 }} 
                       />
                     </div>
@@ -2402,7 +2456,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                         step={1}
                         bordered={false}
                         value={retryLimit} 
-                        onChange={(val) => setRetryLimit(val ?? -1)} 
+                        onChange={handleRetryLimitChange} 
                         style={{ width: 60 }} 
                       />
                     </div>

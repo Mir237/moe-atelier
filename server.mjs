@@ -33,6 +33,8 @@ import {
   loadTaskState,
   normalizeCollectionPayloadForSave,
   normalizeConcurrency,
+  normalizeRetryInterval,
+  normalizeRetryLimit,
   saveBackendCollection,
   saveBackendState,
   saveTaskState,
@@ -48,7 +50,6 @@ const readRequestBody = async (req) => {
   return Buffer.concat(chunks)
 }
 
-const RETRY_DELAY_MS = 1000
 const ORPHAN_CLEANUP_DELAY_MS = 1500
 
 let orphanCleanupTimer = null
@@ -878,7 +879,26 @@ const isAutoRetryPending = (item) => item?.status === 'error' && item?.autoRetry
 
 const isTaskResultActive = (item) => item?.status === 'loading' || item?.autoRetry === true
 
-const scheduleRetry = (taskId, subTaskId) => {
+const getRetryCount = (item) =>
+  typeof item?.retryCount === 'number' && Number.isFinite(item.retryCount)
+    ? item.retryCount
+    : 0
+
+const canAutoRetry = (retryCount, retryLimit) =>
+  retryLimit === -1 || retryCount < retryLimit
+
+const formatRetryIntervalSeconds = (intervalMs) =>
+  Number((intervalMs / 1000).toFixed(3)).toString()
+
+const buildRetryErrorMessage = (message, intervalMs) =>
+  `${message} (${formatRetryIntervalSeconds(intervalMs)}s后重试...)`
+
+const stripRetryScheduleSuffix = (message) => {
+  if (typeof message !== 'string') return ''
+  return message.replace(/\s*\([^()]*后重试\.\.\.\)\s*$/, '').trim()
+}
+
+const scheduleRetry = (taskId, subTaskId, retryInterval) => {
   if (retryTimers.has(subTaskId)) return
   const timer = setTimeout(async () => {
     retryTimers.delete(subTaskId)
@@ -889,8 +909,21 @@ const scheduleRetry = (taskId, subTaskId) => {
     const current = taskState.results[resultIndex]
     if (current?.autoRetry === false) return
     if (!isAutoRetryPending(current)) return
+    const retryLimit = normalizeRetryLimit(taskState.retryLimit)
+    const currentRetryCount = getRetryCount(current)
+    if (!canAutoRetry(currentRetryCount, retryLimit)) {
+      taskState.results[resultIndex] = {
+        ...current,
+        status: 'error',
+        error: stripRetryScheduleSuffix(current?.error) || '未知错误',
+        endTime: Date.now(),
+        autoRetry: false,
+      }
+      await saveTaskState(taskId, taskState)
+      return
+    }
     void runSubTask(taskId, subTaskId, { preserveVisibleState: true })
-  }, RETRY_DELAY_MS)
+  }, retryInterval)
   retryTimers.set(subTaskId, timer)
 }
 
@@ -1028,17 +1061,20 @@ const runSubTask = async (taskId, subTaskId, options = {}) => {
     const freshIndex = freshState.results.findIndex((item) => item.id === subTaskId)
     if (freshIndex === -1) return
     const current = freshState.results[freshIndex]
+    const retryInterval = normalizeRetryInterval(freshState.retryInterval)
+    const retryLimit = normalizeRetryLimit(freshState.retryLimit)
+    const currentRetryCount = getRetryCount(current)
     const shouldRetry = current?.autoRetry !== false
-    if (shouldRetry) {
+    if (shouldRetry && canAutoRetry(currentRetryCount, retryLimit)) {
       freshState.results[freshIndex] = {
         ...current,
         status: 'error',
-        error: `${errorMessage} (1s后重试...)`,
-        retryCount: (current.retryCount || 0) + 1,
+        error: buildRetryErrorMessage(errorMessage, retryInterval),
+        retryCount: currentRetryCount + 1,
         autoRetry: true,
       }
       await saveTaskState(taskId, freshState)
-      scheduleRetry(taskId, subTaskId)
+      scheduleRetry(taskId, subTaskId, retryInterval)
     } else {
       freshState.results[freshIndex] = {
         ...current,
@@ -1350,6 +1386,8 @@ app.put('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
       ...createDefaultTaskState(),
       ...payload,
       concurrency: normalizeConcurrency(payload?.concurrency),
+      retryInterval: normalizeRetryInterval(payload?.retryInterval),
+      retryLimit: normalizeRetryLimit(payload?.retryLimit),
       stats: { ...DEFAULT_TASK_STATS, ...(payload?.stats || {}) },
       results: Array.isArray(payload?.results) ? payload.results : [],
       uploads: Array.isArray(payload?.uploads) ? payload.uploads : [],
@@ -1376,6 +1414,8 @@ app.patch('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
       prompt: typeof payload.prompt === 'string' ? payload.prompt : current.prompt,
       concurrency: normalizeConcurrency(payload?.concurrency, current.concurrency || DEFAULT_CONCURRENCY),
       enableSound: typeof payload.enableSound === 'boolean' ? payload.enableSound : current.enableSound,
+      retryInterval: normalizeRetryInterval(payload?.retryInterval, current.retryInterval),
+      retryLimit: normalizeRetryLimit(payload?.retryLimit, current.retryLimit),
       uploads: Array.isArray(payload?.uploads) ? payload.uploads : current.uploads,
     }
     await saveTaskState(req.params.id, next)
