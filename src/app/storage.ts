@@ -192,7 +192,32 @@ export const loadConfig = (): AppConfig => {
   const formatMap = loadFormatConfigMap();
   if (!raw) {
     const formatConfig = loadFormatConfig(DEFAULT_CONFIG.apiFormat);
-    return { ...DEFAULT_CONFIG, ...formatConfig };
+    const finalConfig = { ...DEFAULT_CONFIG, ...formatConfig };
+    if (!finalConfig.apiProfiles || finalConfig.apiProfiles.length === 0) {
+      finalConfig.apiProfiles = [{
+        id: 'default',
+        name: '默认配置',
+        apiUrl: finalConfig.apiUrl,
+        apiKey: finalConfig.apiKey,
+        model: finalConfig.model,
+        apiFormat: finalConfig.apiFormat,
+        apiVersion: finalConfig.apiVersion,
+        vertexProjectId: finalConfig.vertexProjectId,
+        vertexLocation: finalConfig.vertexLocation,
+        vertexPublisher: finalConfig.vertexPublisher,
+        thinkingBudget: finalConfig.thinkingBudget,
+        includeThoughts: finalConfig.includeThoughts,
+        includeImageConfig: finalConfig.includeImageConfig,
+        includeSafetySettings: finalConfig.includeSafetySettings,
+        safety: finalConfig.safety,
+        imageConfig: finalConfig.imageConfig,
+        webpQuality: finalConfig.webpQuality,
+        useResponseModalities: finalConfig.useResponseModalities,
+        customJson: finalConfig.customJson,
+      }];
+      finalConfig.activeApiProfileId = 'default';
+    }
+    return finalConfig;
   }
   try {
     const data = JSON.parse(raw);
@@ -226,7 +251,32 @@ export const loadConfig = (): AppConfig => {
       ...DEFAULT_FORMAT_CONFIGS[apiFormat],
       ...fallbackFormat,
     };
-    return { ...baseConfig, ...formatConfig, apiFormat };
+    const finalConfig = { ...baseConfig, ...formatConfig, apiFormat };
+    if (!finalConfig.apiProfiles || finalConfig.apiProfiles.length === 0) {
+      finalConfig.apiProfiles = [{
+        id: 'default',
+        name: '默认配置',
+        apiUrl: finalConfig.apiUrl,
+        apiKey: finalConfig.apiKey,
+        model: finalConfig.model,
+        apiFormat: finalConfig.apiFormat,
+        apiVersion: finalConfig.apiVersion,
+        vertexProjectId: finalConfig.vertexProjectId,
+        vertexLocation: finalConfig.vertexLocation,
+        vertexPublisher: finalConfig.vertexPublisher,
+        thinkingBudget: finalConfig.thinkingBudget,
+        includeThoughts: finalConfig.includeThoughts,
+        includeImageConfig: finalConfig.includeImageConfig,
+        includeSafetySettings: finalConfig.includeSafetySettings,
+        safety: finalConfig.safety,
+        imageConfig: finalConfig.imageConfig,
+        webpQuality: finalConfig.webpQuality,
+        useResponseModalities: finalConfig.useResponseModalities,
+        customJson: finalConfig.customJson,
+      }];
+      finalConfig.activeApiProfileId = 'default';
+    }
+    return finalConfig;
   } catch (err) {
     console.warn('Failed to parse config cache:', err);
     return { ...DEFAULT_CONFIG };
@@ -247,6 +297,8 @@ export const saveConfig = (config: AppConfig) => {
     apiFormat: config.apiFormat,
     stream: config.stream,
     enableCollection: config.enableCollection,
+    apiProfiles: config.apiProfiles,
+    activeApiProfileId: config.activeApiProfileId,
   };
   safeStorageSet(STORAGE_KEYS.config, JSON.stringify(baseConfig), 'app cache');
   const formatMap = loadFormatConfigMap();

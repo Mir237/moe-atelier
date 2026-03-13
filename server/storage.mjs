@@ -155,8 +155,7 @@ export const createDefaultTaskState = () => ({
   stats: { ...DEFAULT_TASK_STATS },
 })
 
-export const loadBackendState = async () => {
-  const data = await readJsonFile(backendStatePath, null)
+const normalizeBackendState = (data) => {
   const config = { ...DEFAULT_BACKEND_CONFIG, ...(data?.config || {}) }
   const rawFormatMap = data?.configByFormat
   const configByFormat =
@@ -179,9 +178,25 @@ export const loadBackendState = async () => {
   }
 }
 
+export const buildBackendStateSnapshot = (state, hasSavedState = true) => ({
+  ...state,
+  meta: { hasSavedState },
+})
+
+export const loadBackendState = async () => {
+  const data = await readJsonFile(backendStatePath, null)
+  return normalizeBackendState(data)
+}
+
+export const loadBackendStateSnapshot = async () => {
+  const hasSavedState = fs.existsSync(backendStatePath)
+  const data = await readJsonFile(backendStatePath, null)
+  return buildBackendStateSnapshot(normalizeBackendState(data), hasSavedState)
+}
+
 export const saveBackendState = async (state) => {
   await writeJsonFileAtomic(backendStatePath, state)
-  broadcastSseEvent('state', state)
+  broadcastSseEvent('state', buildBackendStateSnapshot(state))
 }
 
 export const loadBackendCollection = async () => {

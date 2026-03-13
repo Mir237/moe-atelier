@@ -5,6 +5,28 @@ export interface ImageConfig {
   aspectRatio: string;
 }
 
+export interface ApiProfile {
+  id: string;
+  name: string;
+  apiUrl: string;
+  apiKey: string;
+  model: string;
+  apiFormat: 'openai' | 'gemini' | 'vertex';
+  apiVersion: string;
+  vertexProjectId?: string;
+  vertexLocation?: string;
+  vertexPublisher?: string;
+  thinkingBudget: number;
+  includeThoughts: boolean;
+  includeImageConfig: boolean;
+  includeSafetySettings: boolean;
+  safety: SafetySettings;
+  imageConfig: ImageConfig;
+  webpQuality: number;
+  useResponseModalities: boolean;
+  customJson: string;
+}
+
 export interface AppConfig {
   apiUrl: string;
   apiKey: string;
@@ -25,6 +47,9 @@ export interface AppConfig {
   webpQuality: number;
   useResponseModalities: boolean;
   customJson: string;
+
+  apiProfiles?: ApiProfile[];
+  activeApiProfileId?: string;
 }
 
 export interface TaskConfig {

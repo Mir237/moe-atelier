@@ -48,6 +48,7 @@ export const serializeResults = (results: SubTaskResult[]): PersistedSubTaskResu
       id: result.id,
       status: result.status,
       error: result.error,
+      autoRetry: result.autoRetry,
       retryCount: result.retryCount,
       startTime: result.startTime,
       endTime: result.endTime,

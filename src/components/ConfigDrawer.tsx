@@ -24,7 +24,14 @@ import {
   SafetyCertificateFilled,
   SettingFilled,
   ThunderboltFilled,
+  PlusOutlined,
+  DeleteOutlined,
+  EditOutlined,
+  SaveOutlined,
+  CloseOutlined,
 } from '@ant-design/icons';
+import { Popconfirm } from 'antd';
+import { v4 as uuidv4 } from 'uuid';
 import type { FormInstance } from 'antd/es/form';
 import type { AppConfig } from '../types/app';
 import type { ApiFormat } from '../utils/apiUrl';
@@ -76,7 +83,52 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
   onBackendDisable,
   onBackendAuthCancel,
   onBackendAuthConfirm,
-}) => (
+}) => {
+  const [editingProfileId, setEditingProfileId] = React.useState<string | null>(null);
+  const [editingProfileName, setEditingProfileName] = React.useState<string>('');
+
+  const activeProfileId = config.activeApiProfileId || 'default';
+  const profiles = config.apiProfiles || [];
+
+  const handleAddProfile = () => {
+    const { apiProfiles, activeApiProfileId, stream, enableCollection, ...profileFields } = config as any;
+    const newProfile = {
+      ...profileFields,
+      id: uuidv4(),
+      name: `新配置 ${profiles.length + 1}`
+    };
+    const newProfiles = [...profiles, newProfile];
+    onConfigChange({ apiProfiles: newProfiles, activeApiProfileId: newProfile.id }, { ...config, apiProfiles: newProfiles, activeApiProfileId: newProfile.id });
+  };
+
+  const handleDeleteProfile = () => {
+    if (profiles.length <= 1) return;
+    const newProfiles = profiles.filter(p => p.id !== activeProfileId);
+    const newActiveId = newProfiles[0].id;
+    onConfigChange({ apiProfiles: newProfiles, activeApiProfileId: newActiveId }, { ...config, apiProfiles: newProfiles, activeApiProfileId: newActiveId });
+  };
+
+  const handleStartRename = () => {
+    setEditingProfileId(activeProfileId);
+    const currentProfile = profiles.find(p => p.id === activeProfileId);
+    setEditingProfileName(currentProfile?.name || '');
+  };
+
+  const handleSaveRename = () => {
+    if (!editingProfileName.trim()) {
+      setEditingProfileId(null);
+      return;
+    }
+    const newProfiles = profiles.map(p => p.id === activeProfileId ? { ...p, name: editingProfileName.trim() } : p);
+    onConfigChange({ apiProfiles: newProfiles }, { ...config, apiProfiles: newProfiles });
+    setEditingProfileId(null);
+  };
+
+  const handleProfileChange = (value: string) => {
+    onConfigChange({ activeApiProfileId: value }, { ...config, activeApiProfileId: value });
+  };
+
+  return (
   <Drawer
     title={
       <Space>
@@ -104,6 +156,45 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
     styles={{ body: { padding: 24 } }}
   >
     <Form layout="vertical" initialValues={config} onValuesChange={onConfigChange} form={form}>
+      
+      <Form.Item label={<span style={{ fontWeight: 700, color: '#665555' }}>API 配置档</span>} style={{ marginBottom: 24 }}>
+        {editingProfileId === activeProfileId ? (
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <Input 
+              value={editingProfileName} 
+              onChange={e => setEditingProfileName(e.target.value)} 
+              onPressEnter={handleSaveRename}
+              style={{ flex: 1 }}
+              autoFocus
+            />
+            <Button icon={<SaveOutlined />} type="primary" onClick={handleSaveRename} />
+            <Button icon={<CloseOutlined />} onClick={() => setEditingProfileId(null)} />
+          </div>
+        ) : (
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <Select
+              value={activeProfileId}
+              onChange={handleProfileChange}
+              options={profiles.map(p => ({ label: p.name, value: p.id }))}
+              style={{ flex: 1 }}
+            />
+            <Tooltip title="重命名当前配置">
+              <Button icon={<EditOutlined />} onClick={handleStartRename} />
+            </Tooltip>
+            <Tooltip title="添加新配置">
+              <Button icon={<PlusOutlined />} onClick={handleAddProfile} />
+            </Tooltip>
+            <Tooltip title="删除当前配置">
+              <Popconfirm title="确定删除当前配置档？" onConfirm={handleDeleteProfile} disabled={profiles.length <= 1}>
+                <Button icon={<DeleteOutlined />} danger disabled={profiles.length <= 1} />
+              </Popconfirm>
+            </Tooltip>
+          </div>
+        )}
+      </Form.Item>
+
+      <div style={{ borderBottom: '1px solid #f0f0f0', marginBottom: 24 }} />
+
       <Form.Item label={<span style={{ fontWeight: 700, color: '#665555' }}>API 格式</span>}>
         <Form.Item name="apiFormat" noStyle>
           <Radio.Group optionType="button" buttonStyle="solid">
@@ -454,6 +545,7 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
       </div>
     </Form>
   </Drawer>
-);
+  );
+};
 
 export default ConfigDrawer;

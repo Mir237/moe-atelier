@@ -5,12 +5,19 @@ import type { PersistedImageTaskState } from '../types/imageTask';
 import type { ApiFormat } from './apiUrl';
 import type { FormatConfig } from '../app/storage';
 import { safeStorageGet, safeStorageRemove, safeStorageSet } from './storage';
+import { formatResponseErrorMessage } from './httpError';
 
 export interface BackendState {
   config: AppConfig;
   configByFormat?: Partial<Record<ApiFormat, FormatConfig>>;
   tasksOrder: string[];
   globalStats: GlobalStats;
+}
+
+export interface BackendStateSnapshot extends BackendState {
+  meta: {
+    hasSavedState: boolean;
+  };
 }
 
 const BACKEND_MODE_KEY = 'moe-image-backend-mode';
@@ -45,15 +52,27 @@ const buildBackendHeaders = (headers?: HeadersInit) => {
   return next;
 };
 
+const buildBackendHttpError = async (
+  response: Response,
+  code?: string,
+) => {
+  const error = new Error(
+    await formatResponseErrorMessage(response, response.statusText || '请求失败'),
+  ) as Error & { code?: string; status?: number };
+  error.status = response.status;
+  if (code) {
+    error.code = code;
+  }
+  return error;
+};
+
 const backendFetch = async (path: string, options: RequestInit = {}) => {
   const response = await fetch(path, {
     ...options,
     headers: buildBackendHeaders(options.headers),
   });
   if (response.status === 401) {
-    const error = new Error('BACKEND_UNAUTHORIZED');
-    (error as Error & { code?: string }).code = 'BACKEND_UNAUTHORIZED';
-    throw error;
+    throw await buildBackendHttpError(response, 'BACKEND_UNAUTHORIZED');
   }
   return response;
 };
@@ -61,6 +80,24 @@ const backendFetch = async (path: string, options: RequestInit = {}) => {
 type BackendJsonOptions = Omit<RequestInit, 'body' | 'headers'> & {
   body?: unknown;
   headers?: HeadersInit;
+};
+
+const backendOk = async (
+  path: string,
+  options: BackendJsonOptions = {},
+): Promise<void> => {
+  const headers = new Headers(options.headers);
+  if (typeof options.body !== 'undefined') {
+    headers.set('Content-Type', 'application/json');
+  }
+  const response = await backendFetch(path, {
+    ...options,
+    headers,
+    body: typeof options.body !== 'undefined' ? JSON.stringify(options.body) : undefined,
+  });
+  if (!response.ok) {
+    throw await buildBackendHttpError(response);
+  }
 };
 
 const backendJson = async <T>(
@@ -75,8 +112,7 @@ const backendJson = async <T>(
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || response.statusText);
+    throw await buildBackendHttpError(response);
   }
   return (await response.json()) as T;
 };
@@ -89,10 +125,11 @@ export const authBackend = async (password: string) => {
   return data.token;
 };
 
-export const fetchBackendState = async () => backendJson<BackendState>('/api/backend/state');
+export const fetchBackendState = async () =>
+  backendJson<BackendStateSnapshot>('/api/backend/state');
 
 export const patchBackendState = async (payload: Partial<BackendState>) =>
-  backendJson<BackendState>('/api/backend/state', {
+  backendJson<BackendStateSnapshot>('/api/backend/state', {
     method: 'PATCH',
     body: payload,
   });
@@ -141,16 +178,15 @@ export const cleanupBackendImages = async (keys: string[]) =>
   });
 
 export const generateBackendTask = async (taskId: string) =>
-  backendJson<PersistedImageTaskState>(
-    `/api/backend/task/${encodeURIComponent(taskId)}/generate`,
-    { method: 'POST' },
-  );
+  backendOk(`/api/backend/task/${encodeURIComponent(taskId)}/generate`, {
+    method: 'POST',
+  });
 
 export const retryBackendSubTask = async (taskId: string, subTaskId: string) =>
-  backendJson<PersistedImageTaskState>(
-    `/api/backend/task/${encodeURIComponent(taskId)}/retry`,
-    { method: 'POST', body: { subTaskId } },
-  );
+  backendOk(`/api/backend/task/${encodeURIComponent(taskId)}/retry`, {
+    method: 'POST',
+    body: { subTaskId },
+  });
 
 export type BackendStopMode = 'pause' | 'abort';
 
@@ -159,10 +195,10 @@ export const stopBackendSubTask = async (
   subTaskId?: string,
   mode: BackendStopMode = 'pause',
 ) =>
-  backendJson<PersistedImageTaskState>(
-    `/api/backend/task/${encodeURIComponent(taskId)}/stop`,
-    { method: 'POST', body: { subTaskId, mode } },
-  );
+  backendOk(`/api/backend/task/${encodeURIComponent(taskId)}/stop`, {
+    method: 'POST',
+    body: { subTaskId, mode },
+  });
 
 export const uploadBackendImage = async (
   blob: Blob,
@@ -180,8 +216,7 @@ export const uploadBackendImage = async (
     body: blob,
   });
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || response.statusText);
+    throw await buildBackendHttpError(response);
   }
   return (await response.json()) as { key: string; url: string };
 };

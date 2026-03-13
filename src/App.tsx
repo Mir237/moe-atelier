@@ -1,4 +1,4 @@
-﻿import * as React from 'react';
+import * as React from 'react';
 import { useState, useCallback, useRef } from 'react';
 import { Layout, Button, Form, Row, Col, Typography, Space, ConfigProvider, message, Tooltip } from 'antd';
 import { 
@@ -8,9 +8,11 @@ import {
   CheckCircleFilled, 
   HeartFilled,
   AppstoreFilled,
-  ExperimentFilled,
-  ReloadOutlined,
-  DeleteFilled
+  DeleteFilled,
+  RocketFilled,
+  HourglassFilled,
+  DashboardFilled,
+  TrophyFilled
 } from '@ant-design/icons';
 import { v4 as uuidv4 } from 'uuid';
 import PromptDrawer from './components/PromptDrawer';
@@ -65,7 +67,7 @@ import {
   putBackendCollection,
   setBackendMode as persistBackendMode,
   setBackendToken,
-  type BackendState,
+  type BackendStateSnapshot,
 } from './utils/backendApi';
 
 const { Header, Content } = Layout;
@@ -131,23 +133,20 @@ function App() {
   const [backendSyncing, setBackendSyncing] = useState(false);
   const backendModeRef = useRef(initialBackendMode);
   const configRef = useRef(config);
-  const configVisibleRef = useRef(configVisible);
   const backendFormatConfigsRef = useRef<FormatConfigMap>(
     buildBackendFormatConfigs(null),
   );
   const localHydratingRef = useRef(false);
   const backendApplyingRef = useRef(false);
   const backendBootstrappedRef = useRef(false);
+  const backendBootstrappingRef = useRef(initialBackendMode);
   const backendReadyRef = useRef(false);
   const backendCollectionHydratingRef = useRef(false);
   const backendCollectionSyncTimerRef = useRef<number | null>(null);
   const backendCollectionLastPayloadRef = useRef<string>('');
   const collectedItemsRef = useRef(collectedItems);
   const collectionCountRef = useRef(collectedItems.length);
-  const configGuard = useInputGuard({
-    isEditing: () => configVisibleRef.current,
-    idleMs: 700,
-  });
+  const configGuard = useInputGuard({ idleMs: 700 });
   const backendConfigPayload =
     backendMode && backendReadyRef.current
       ? { config, configByFormat: backendFormatConfigsRef.current }
@@ -175,7 +174,7 @@ function App() {
   } = configGuard;
   const { markSynced: markConfigSynced } = configSync;
 
-  const applyBackendState = useCallback((state: BackendState) => {
+  const applyBackendState = useCallback((state: BackendStateSnapshot) => {
       if (!backendModeRef.current) return;
       backendApplyingRef.current = true;
       backendReadyRef.current = true;
@@ -186,7 +185,8 @@ function App() {
         );
         const incomingKey = JSON.stringify(state.config);
         const currentKey = JSON.stringify(configRef.current);
-        const preserveConfig = shouldPreserveConfig(incomingKey, currentKey);
+        const preserveConfig =
+          !backendBootstrappingRef.current && shouldPreserveConfig(incomingKey, currentKey);
         if (preserveConfig) {
           const localConfig = configRef.current;
           const localFormat =
@@ -230,38 +230,47 @@ function App() {
       window.setTimeout(() => {
         backendApplyingRef.current = false;
       }, 200);
-    }, [form]);
+    }, [clearConfigDirty, markConfigSynced, shouldPreserveConfig]);
 
   const bootstrapBackendState = useCallback(async () => {
+    backendBootstrappingRef.current = true;
     setBackendSyncing(true);
     try {
-      const state = await fetchBackendState();
+      let state = await fetchBackendState();
       if (!backendModeRef.current) return;
-      if (state.tasksOrder.length === 0) {
+
+      if (!state.meta.hasSavedState) {
         const seededFormatConfigs = buildBackendFormatConfigs(null, config);
         backendFormatConfigsRef.current = seededFormatConfigs;
-        await patchBackendState({
+        state = await patchBackendState({
           config,
           configByFormat: seededFormatConfigs,
         });
-        applyBackendState({ ...state, config, configByFormat: seededFormatConfigs });
+        if (!backendModeRef.current) return;
+      }
+
+      applyBackendState(state);
+      if (!backendModeRef.current) return;
+
+      if (state.tasksOrder.length === 0) {
         const newTaskId = uuidv4();
         await putBackendTask(newTaskId, {
           version: TASK_STATE_VERSION,
           prompt: '',
           concurrency: 2,
           enableSound: true,
+          retryInterval: 1000,
+          retryLimit: -1,
           results: [],
           uploads: [],
           stats: DEFAULT_TASK_STATS,
         });
-        await patchBackendState({ tasksOrder: [newTaskId] });
-        if (backendModeRef.current) {
-          setTasks([{ id: newTaskId, prompt: '' }]);
-        }
+        if (!backendModeRef.current) return;
+        state = await patchBackendState({ tasksOrder: [newTaskId] });
+        if (!backendModeRef.current) return;
+        applyBackendState(state);
         return;
       }
-      applyBackendState(state);
     } catch (err: any) {
       console.error(err);
       message.error('后端模式初始化失败，请检查密码或服务状态');
@@ -275,6 +284,7 @@ function App() {
       setTasks(loadTasks());
       setGlobalStats(loadGlobalStats());
     } finally {
+      backendBootstrappingRef.current = false;
       setBackendSyncing(false);
     }
   }, [applyBackendState, config]);
@@ -291,6 +301,7 @@ function App() {
     persistBackendMode(false);
     localHydratingRef.current = true;
     backendModeRef.current = false;
+    backendBootstrappingRef.current = false;
     setBackendModeState(false);
     const localConfig = loadConfig();
     setConfig(localConfig);
@@ -334,7 +345,6 @@ function App() {
   }, [config]);
 
   React.useEffect(() => {
-    configVisibleRef.current = configVisible;
     if (!configVisible) {
       clearConfigDirty();
     }
@@ -441,6 +451,7 @@ function App() {
   React.useEffect(() => {
     if (!backendMode) {
       backendBootstrappedRef.current = false;
+      backendBootstrappingRef.current = false;
       backendReadyRef.current = false;
       return;
     }
@@ -658,6 +669,8 @@ function App() {
         prompt: '',
         concurrency: 2,
         enableSound: true,
+        retryInterval: 1000,
+        retryLimit: -1,
         results: [],
         uploads: [],
         stats: DEFAULT_TASK_STATS,
@@ -684,6 +697,8 @@ function App() {
         prompt: prompt,
         concurrency: 2,
         enableSound: true,
+        retryInterval: 1000,
+        retryLimit: -1,
         results: [],
         uploads: [],
         stats: DEFAULT_TASK_STATS,
@@ -698,6 +713,8 @@ function App() {
         // If we could handle image upload here we would, but for now just prompt
         concurrency: 2,
         enableSound: true,
+        retryInterval: 1000,
+        retryLimit: -1,
         results: [],
         uploads: [],
         stats: DEFAULT_TASK_STATS,
@@ -732,6 +749,8 @@ function App() {
         prompt: prompt,
         concurrency: 2,
         enableSound: true,
+        retryInterval: 1000,
+        retryLimit: -1,
         results: [],
         uploads: uploads,
         stats: DEFAULT_TASK_STATS,
@@ -745,6 +764,8 @@ function App() {
         prompt: prompt,
         concurrency: 2,
         enableSound: true,
+        retryInterval: 1000,
+        retryLimit: -1,
         results: [],
         uploads: uploads,
         stats: DEFAULT_TASK_STATS,
@@ -790,8 +811,32 @@ function App() {
   };
 
   const handleConfigChange = (changedValues: any, allValues: AppConfig) => {
-    const nextFormat = allValues.apiFormat || config.apiFormat;
-    let nextConfig = { ...config, ...allValues, apiFormat: nextFormat };
+    let nextConfig = { ...config, ...allValues };
+
+    if (changedValues.activeApiProfileId && changedValues.activeApiProfileId !== config.activeApiProfileId) {
+      const selectedProfile = nextConfig.apiProfiles?.find(p => p.id === changedValues.activeApiProfileId);
+      if (selectedProfile) {
+        const { id, name, ...profileFields } = selectedProfile;
+        nextConfig = { ...nextConfig, ...profileFields };
+        form.setFieldsValue(profileFields);
+        changedValues.apiFormat = selectedProfile.apiFormat; // Trigger format config load if format differs
+      }
+    } else if (!changedValues.apiProfiles) {
+      // Normal field change, sync to active profile
+      const profileKeys = ['apiUrl', 'apiKey', 'model', 'apiFormat', 'apiVersion', 'vertexProjectId', 'vertexLocation', 'vertexPublisher', 'thinkingBudget', 'includeThoughts', 'includeImageConfig', 'includeSafetySettings', 'safety', 'imageConfig', 'webpQuality', 'useResponseModalities', 'customJson'];
+      const isProfileFieldChanged = Object.keys(changedValues).some(k => profileKeys.includes(k));
+      if (isProfileFieldChanged && nextConfig.apiProfiles) {
+        nextConfig.apiProfiles = nextConfig.apiProfiles.map(p => 
+          p.id === nextConfig.activeApiProfileId 
+            ? { ...p, ...profileKeys.reduce((acc, key) => ({ ...acc, [key]: (nextConfig as any)[key] }), {}) }
+            : p
+        );
+      }
+    }
+
+    const nextFormat = nextConfig.apiFormat || config.apiFormat;
+    nextConfig.apiFormat = nextFormat;
+
     const formatChanged =
       typeof changedValues?.apiFormat === 'string' &&
       changedValues.apiFormat !== config.apiFormat;
@@ -800,7 +845,7 @@ function App() {
       markConfigDirty();
     }
 
-    if (formatChanged) {
+    if (formatChanged && !changedValues.activeApiProfileId) {
       const formatConfig = backendMode
         ? getBackendFormatConfig(nextFormat)
         : loadFormatConfig(nextFormat);
@@ -990,7 +1035,7 @@ function App() {
   
   const averageTime = globalStats.successCount > 0 
     ? formatDuration(globalStats.totalTime / globalStats.successCount)
-    : '0.0s';
+    : '0s';
   
   const fastestTimeStr = formatDuration(globalStats.fastestTime);
 
@@ -1035,29 +1080,33 @@ function App() {
           position: 'sticky',
           top: 0,
           zIndex: 100,
-          background: 'rgba(255, 255, 255, 0.8)',
+          background: 'rgba(255, 255, 255, 0.9)',
           backdropFilter: 'blur(12px)',
-          borderBottom: '1px solid rgba(255, 255, 255, 0.5)',
-          boxShadow: '0 4px 20px rgba(255, 158, 181, 0.05)'
+          borderBottom: '2px dashed #FFF0F3',
+          boxShadow: '0 4px 20px rgba(255, 158, 181, 0.1)'
         }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
             <div className="hover-scale" style={{ 
-              width: 40, 
-              height: 40, 
+              width: 44, 
+              height: 44, 
               background: 'linear-gradient(135deg, #FF9EB5 0%, #FF7090 100%)', 
-              borderRadius: 14, 
+              borderRadius: 16, 
               display: 'flex', 
               alignItems: 'center', 
               justifyContent: 'center',
-              boxShadow: '0 4px 12px rgba(255, 158, 181, 0.4)',
-              transform: 'rotate(-6deg)',
+              boxShadow: '0 6px 0 #FF7090, 0 8px 16px rgba(255, 158, 181, 0.4)',
+              transform: 'rotate(-8deg)',
+              border: '2px solid #fff'
             }}>
-              <HeartFilled style={{ fontSize: 20, color: '#fff' }} />
+              <HeartFilled style={{ fontSize: 24, color: '#fff' }} />
             </div>
-            <div>
-              <Title level={4} style={{ margin: 0, color: '#665555', fontWeight: 800, letterSpacing: '-0.5px', lineHeight: 1, whiteSpace: 'nowrap' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center' }}>
+              <Title level={3} style={{ margin: 0, color: '#665555', fontWeight: 800, letterSpacing: '-0.5px', lineHeight: 1, whiteSpace: 'nowrap' }}>
                 萌图 <span style={{ color: '#FF9EB5' }}>工坊</span>
               </Title>
+              <Text style={{ margin: 0, color: '#FF9EB5', fontWeight: 700, fontSize: 12, letterSpacing: '0.5px', lineHeight: 1, marginTop: 4 }}>
+                moe atelier
+              </Text>
             </div>
           </div>
 
@@ -1157,8 +1206,9 @@ function App() {
                 <Col xs={12} sm={8} lg={4}>
                   <div className="stat-item">
                     <div style={{ 
-                      width: 40, height: 40, borderRadius: '50%', background: '#E0F7FA', color: '#00BCD4',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, marginBottom: 8
+                      width: 48, height: 48, borderRadius: 16, background: '#FFF0F3', color: '#FF9EB5',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, marginBottom: 12,
+                      boxShadow: '0 4px 0 #FFB7C5, 0 4px 8px rgba(255,158,181,0.2)', transform: 'rotate(-5deg)'
                     }}>
                       <ThunderboltFilled />
                     </div>
@@ -1169,24 +1219,26 @@ function App() {
                 <Col xs={12} sm={8} lg={4}>
                   <div className="stat-item">
                     <div style={{ 
-                      width: 40, height: 40, borderRadius: '50%', background: '#E8F5E9', color: '#4CAF50',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, marginBottom: 8
+                      width: 48, height: 48, borderRadius: 16, background: '#E8F5E9', color: '#6BCB8A',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, marginBottom: 12,
+                      boxShadow: '0 4px 0 #A7E8BD, 0 4px 8px rgba(107,203,138,0.2)', transform: 'rotate(5deg)'
                     }}>
                       <CheckCircleFilled />
                     </div>
-                    <div className="stat-value" style={{ color: '#4CAF50' }}>{globalStats.successCount}</div>
+                    <div className="stat-value" style={{ color: '#6BCB8A' }}>{globalStats.successCount}</div>
                     <div className="stat-label">成功生成</div>
                   </div>
                 </Col>
                 <Col xs={12} sm={8} lg={4}>
                   <div className="stat-item">
                     <div style={{ 
-                      width: 40, height: 40, borderRadius: '50%', background: '#FFF8E1', color: '#FFC107',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, marginBottom: 8
+                      width: 48, height: 48, borderRadius: 16, background: '#FFF8D6', color: '#FFC857',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, marginBottom: 12,
+                      boxShadow: '0 4px 0 #FFE5A0, 0 4px 8px rgba(255,200,87,0.2)', transform: 'rotate(-5deg)'
                     }}>
-                      <ExperimentFilled />
+                      <TrophyFilled />
                     </div>
-                    <div className="stat-value" style={{ color: successRate > 80 ? '#4CAF50' : '#FFC107' }}>
+                    <div className="stat-value" style={{ color: successRate > 80 ? '#6BCB8A' : '#FFC857' }}>
                       {successRate}%
                     </div>
                     <div className="stat-label">成功率</div>
@@ -1195,34 +1247,37 @@ function App() {
                 <Col xs={12} sm={8} lg={4}>
                   <div className="stat-item">
                     <div style={{ 
-                      width: 40, height: 40, borderRadius: '50%', background: '#E3F2FD', color: '#2196F3',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, marginBottom: 8
+                      width: 48, height: 48, borderRadius: 16, background: '#E0F7FA', color: '#00BCD4',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, marginBottom: 12,
+                      boxShadow: '0 4px 0 #A0E1E8, 0 4px 8px rgba(0,188,212,0.2)', transform: 'rotate(5deg)'
                     }}>
-                      <ThunderboltFilled />
+                      <RocketFilled />
                     </div>
-                    <div className="stat-value" style={{ color: '#2196F3' }}>{fastestTimeStr}</div>
+                    <div className="stat-value" style={{ color: '#00BCD4' }}>{fastestTimeStr}</div>
                     <div className="stat-label">最快用时</div>
                   </div>
                 </Col>
                 <Col xs={12} sm={8} lg={4}>
                   <div className="stat-item">
                     <div style={{ 
-                      width: 40, height: 40, borderRadius: '50%', background: '#FFEBEE', color: '#FF5252',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, marginBottom: 8
+                      width: 48, height: 48, borderRadius: 16, background: '#FFF3E0', color: '#FF9800',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, marginBottom: 12,
+                      boxShadow: '0 4px 0 #FFCC80, 0 4px 8px rgba(255,152,0,0.2)', transform: 'rotate(-5deg)'
                     }}>
-                      <ThunderboltFilled />
+                      <HourglassFilled />
                     </div>
-                    <div className="stat-value" style={{ color: '#FF5252' }}>{slowestTimeStr}</div>
+                    <div className="stat-value" style={{ color: '#FF9800' }}>{slowestTimeStr}</div>
                     <div className="stat-label">最慢用时</div>
                   </div>
                 </Col>
                 <Col xs={12} sm={8} lg={4}>
                   <div className="stat-item">
                     <div style={{ 
-                      width: 40, height: 40, borderRadius: '50%', background: '#F3E5F5', color: '#9C27B0',
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, marginBottom: 8
+                      width: 48, height: 48, borderRadius: 16, background: '#F3E5F5', color: '#9C27B0',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 24, marginBottom: 12,
+                      boxShadow: '0 4px 0 #E1BEE7, 0 4px 8px rgba(156,39,176,0.2)', transform: 'rotate(5deg)'
                     }}>
-                      <ReloadOutlined />
+                      <DashboardFilled />
                     </div>
                     <div className="stat-value" style={{ color: '#9C27B0' }}>{averageTime}</div>
                     <div className="stat-label">平均用时</div>

@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   Input, Button, Upload, message, Spin, Image, 
-  Space, Typography, Tooltip, Progress
+  Space, Typography, Tooltip, Popover, InputNumber, Select
 } from 'antd';
 import { 
   UploadOutlined, DeleteFilled, ReloadOutlined, 
@@ -11,7 +11,8 @@ import {
   LoadingOutlined,
   PlayCircleFilled,
   HolderOutlined,
-  CloudUploadOutlined
+  CloudUploadOutlined,
+  SettingFilled
 } from '@ant-design/icons';
 import type { RcFile, UploadFile } from 'antd/es/upload/interface';
 import axios from 'axios';
@@ -50,6 +51,10 @@ import {
   uploadBackendImage,
   stripBackendToken,
 } from '../utils/backendApi';
+import {
+  formatResponseErrorMessage,
+  formatUnknownErrorMessage,
+} from '../utils/httpError';
 import { useDebouncedSync, useInputGuard } from '../utils/inputSync';
 
 const { Text } = Typography;
@@ -69,6 +74,7 @@ interface ImageTaskProps {
 }
 const SUCCESS_AUDIO_SRC = 'https://actions.google.com/sounds/v1/cartoon/magic_chime.ogg';
 const DEFAULT_CONCURRENCY = 2;
+const BACKEND_RESULT_TRANSITION_DELAY_MS = 400;
 
 type UploadFileWithMeta = UploadFile & {
   localKey?: string;
@@ -93,10 +99,15 @@ type CollectionRequestSnapshot = {
 const normalizeStoredResult = (item: PersistedSubTaskResult, backendMode: boolean): SubTaskResult => {
   const wasLoading = item.status === 'loading' || item.status === 'pending';
   const shouldMarkInterrupted = wasLoading && !backendMode;
+  const inferredAutoRetry =
+    typeof item.autoRetry === 'boolean'
+      ? item.autoRetry
+      : wasLoading || Boolean(item.error?.includes('后重试...'));
   return {
     id: item.id,
     status: shouldMarkInterrupted ? 'error' : item.status,
     error: shouldMarkInterrupted ? '刷新后已中断' : item.error,
+    autoRetry: shouldMarkInterrupted ? false : inferredAutoRetry,
     retryCount: typeof item.retryCount === 'number' ? item.retryCount : 0,
     startTime: item.startTime,
     endTime: item.endTime,
@@ -139,6 +150,33 @@ const normalizeConcurrency = (value: unknown, fallback = DEFAULT_CONCURRENCY) =>
   return Math.max(1, Math.floor(value));
 };
 
+const isResultActive = (result?: Pick<SubTaskResult, 'status' | 'autoRetry'> | null) =>
+  Boolean(result && (result.status === 'loading' || result.autoRetry));
+
+const isAutoRetryErrorResult = (result?: Pick<SubTaskResult, 'status' | 'autoRetry'> | null) =>
+  Boolean(result && result.status === 'error' && result.autoRetry);
+
+const shouldDelayBackendResultTransition = (
+  previous?: SubTaskResult,
+  next?: SubTaskResult,
+) => {
+  if (!previous || !next) return false;
+  if (!isAutoRetryErrorResult(previous)) return false;
+  if (next.status === 'success') return true;
+  if (next.status !== 'error') return false;
+  if (next.error === '已停止' || next.error === '已暂停重试') {
+    return false;
+  }
+  return (
+    previous.retryCount !== next.retryCount ||
+    previous.error !== next.error ||
+    Boolean(previous.autoRetry) !== Boolean(next.autoRetry) ||
+    previous.localKey !== next.localKey ||
+    previous.sourceUrl !== next.sourceUrl ||
+    previous.displayUrl !== next.displayUrl
+  );
+};
+
 const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMode, onRemove, onStatsUpdate, onCollect, collectionRevision, dragAttributes, dragListeners }: ImageTaskProps) => {
   const [prompt, setPrompt] = useState('');
   const promptRef = useRef(prompt);
@@ -148,6 +186,9 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const [concurrency, setConcurrency] = useState<number>(DEFAULT_CONCURRENCY);
   const [concurrencyInput, setConcurrencyInput] = useState<string>(String(DEFAULT_CONCURRENCY));
   const [enableSound, setEnableSound] = useState<boolean>(true);
+  const [retryInterval, setRetryInterval] = useState<number>(1000);
+  const [retryLimit, setRetryLimit] = useState<number>(-1);
+  const [apiProfileId, setApiProfileId] = useState<string>('default');
   
   const [results, setResults] = useState<SubTaskResult[]>([]);
   const [isGlobalLoading, setIsGlobalLoading] = useState(false);
@@ -159,6 +200,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const isRetryingRef = useRef<Map<string, boolean>>(new Map());
   const taskStartTimesRef = useRef<Map<string, number>>(new Map());
   const retryTimersRef = useRef<Map<string, number>>(new Map());
+  const backendTransitionTimersRef = useRef<Map<string, number>>(new Map());
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const prevResultsRef = useRef<SubTaskResult[]>([]);
   const dbPromiseRef = useRef<Promise<IDBDatabase> | null>(null);
@@ -167,7 +209,16 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const cachedUploadKeysRef = useRef<Set<string>>(new Set());
   const collectedCollectionKeysRef = useRef<Set<string>>(new Set());
   const requestContextByResultIdRef = useRef<Map<string, CollectionRequestSnapshot>>(new Map());
+  const pendingBackendGenerateSnapshotRef = useRef<CollectionRequestSnapshot | null>(null);
   const lastCollectionRevisionRef = useRef(collectionRevision);
+  const retrySettingsRef = useRef({ interval: retryInterval, limit: retryLimit });
+  useEffect(() => {
+    retrySettingsRef.current = { interval: retryInterval, limit: retryLimit };
+  }, [retryInterval, retryLimit]);
+  const currentResultsRef = useRef<SubTaskResult[]>(results);
+  useEffect(() => {
+    currentResultsRef.current = results;
+  }, [results]);
   const promptGuard = useInputGuard({ isEditing: () => promptFocusedRef.current });
   const backendPayload = React.useMemo(() => {
     if (!backendMode || !hydrated) return null;
@@ -175,9 +226,12 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       prompt,
       concurrency,
       enableSound,
+      retryInterval,
+      retryLimit,
+      apiProfileId,
       uploads: normalizeUploadsPayload(serializeUploads(fileList)),
     };
-  }, [backendMode, hydrated, prompt, concurrency, enableSound, fileList]);
+  }, [backendMode, hydrated, prompt, concurrency, enableSound, retryInterval, retryLimit, apiProfileId, fileList]);
   const taskSync = useDebouncedSync({
     enabled: backendMode && hydrated,
     payload: backendPayload,
@@ -222,6 +276,72 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     return match ? decodeURIComponent(match[1]) : undefined;
   };
 
+  const clearBackendTransitionTimer = (resultId?: string) => {
+    if (resultId) {
+      const timerId = backendTransitionTimersRef.current.get(resultId);
+      if (timerId) {
+        clearTimeout(timerId);
+        backendTransitionTimersRef.current.delete(resultId);
+      }
+      return;
+    }
+    backendTransitionTimersRef.current.forEach((timerId) => clearTimeout(timerId));
+    backendTransitionTimersRef.current.clear();
+  };
+
+  const applyBackendResults = (nextResults: SubTaskResult[]) => {
+    const previousResults = currentResultsRef.current;
+    const previousById = new Map(previousResults.map((item) => [item.id, item]));
+    const delayedIds = new Set(
+      nextResults
+        .filter((item) => shouldDelayBackendResultTransition(previousById.get(item.id), item))
+        .map((item) => item.id),
+    );
+
+    backendTransitionTimersRef.current.forEach((_timerId, resultId) => {
+      if (!nextResults.some((item) => item.id === resultId)) {
+        clearBackendTransitionTimer(resultId);
+      }
+    });
+
+    if (delayedIds.size === 0) {
+      nextResults.forEach((item) => clearBackendTransitionTimer(item.id));
+      currentResultsRef.current = nextResults;
+      setResults(nextResults);
+      return;
+    }
+
+    const immediateResults = nextResults.map((item) =>
+      delayedIds.has(item.id) ? previousById.get(item.id) || item : item,
+    );
+    currentResultsRef.current = immediateResults;
+    setResults(immediateResults);
+
+    nextResults.forEach((item) => {
+      if (!delayedIds.has(item.id)) {
+        clearBackendTransitionTimer(item.id);
+        return;
+      }
+
+      clearBackendTransitionTimer(item.id);
+      const paperEl = document.getElementById(`paper-${item.id}`);
+      if (paperEl) {
+        paperEl.classList.add('polaroid-dropping');
+      }
+      const timerId = window.setTimeout(() => {
+        clearBackendTransitionTimer(item.id);
+        setResults((current) => {
+          const updated = current.map((currentItem) =>
+            currentItem.id === item.id ? item : currentItem,
+          );
+          currentResultsRef.current = updated;
+          return updated;
+        });
+      }, BACKEND_RESULT_TRANSITION_DELAY_MS);
+      backendTransitionTimersRef.current.set(item.id, timerId);
+    });
+  };
+
   const applyBackendTaskState = (
     stored: PersistedImageTaskState,
     options: { preserveUploads?: boolean; preservePrompt?: boolean } = {},
@@ -233,13 +353,21 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       shouldPreservePromptInput(nextPrompt, currentPrompt);
     const nextConcurrency = normalizeConcurrency(stored.concurrency, DEFAULT_CONCURRENCY);
     const nextEnableSound = typeof stored.enableSound === 'boolean' ? stored.enableSound : true;
+    const nextRetryInterval = typeof stored.retryInterval === 'number' ? stored.retryInterval : 1000;
+    const nextRetryLimit = typeof stored.retryLimit === 'number' ? stored.retryLimit : -1;
+    const nextApiProfileId = stored.apiProfileId || config.activeApiProfileId || 'default';
     const storedUploads = Array.isArray(stored.uploads) ? stored.uploads : [];
     markTaskSynced({
       prompt: nextPrompt,
       concurrency: nextConcurrency,
       enableSound: nextEnableSound,
+      retryInterval: nextRetryInterval,
+      retryLimit: nextRetryLimit,
+      apiProfileId: nextApiProfileId,
       uploads: normalizeUploadsPayload(storedUploads),
     });
+
+    setApiProfileId(nextApiProfileId);
 
     if (!shouldPreservePrompt) {
       promptRef.current = nextPrompt;
@@ -251,9 +379,12 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     setConcurrency(nextConcurrency);
     setConcurrencyInput(String(nextConcurrency));
     setEnableSound(nextEnableSound);
+    setRetryInterval(nextRetryInterval);
+    setRetryLimit(nextRetryLimit);
     setStats({ ...DEFAULT_TASK_STATS, ...(stored.stats || {}) });
 
     const storedResults = Array.isArray(stored.results) ? stored.results : [];
+    const previousResultIds = new Set(currentResultsRef.current.map((item) => item.id));
     const hydratedResults = storedResults.map((item) => {
       const normalized = normalizeStoredResult(item, true);
       if (normalized.sourceUrl && normalized.sourceUrl.includes('/api/backend/image/')) {
@@ -265,7 +396,23 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       );
       return normalized;
     });
-    setResults(hydratedResults);
+    if (pendingBackendGenerateSnapshotRef.current) {
+      const newLoadingResults = hydratedResults.filter(
+        (item) =>
+          !previousResultIds.has(item.id) &&
+          (item.status === 'loading' || item.status === 'pending'),
+      );
+      if (newLoadingResults.length > 0) {
+        newLoadingResults.forEach((item) => {
+          requestContextByResultIdRef.current.set(
+            item.id,
+            pendingBackendGenerateSnapshotRef.current as CollectionRequestSnapshot,
+          );
+        });
+        pendingBackendGenerateSnapshotRef.current = null;
+      }
+    }
+    applyBackendResults(hydratedResults);
 
     if (!options.preserveUploads) {
       const hydratedUploads: UploadFileWithMeta[] = storedUploads.map((item) => {
@@ -322,6 +469,9 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         setConcurrency(nextConcurrency);
         setConcurrencyInput(String(nextConcurrency));
         setEnableSound(typeof stored.enableSound === 'boolean' ? stored.enableSound : true);
+        setRetryInterval(typeof stored.retryInterval === 'number' ? stored.retryInterval : 1000);
+        setRetryLimit(typeof stored.retryLimit === 'number' ? stored.retryLimit : -1);
+        setApiProfileId(stored.apiProfileId || config.activeApiProfileId || 'default');
         setStats({ ...DEFAULT_TASK_STATS, ...(stored.stats || {}) });
         const storedResults = Array.isArray(stored.results) ? stored.results : [];
         const hydratedResults: SubTaskResult[] = [];
@@ -342,6 +492,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
           hydratedResults.push(normalized);
         }
         if (isActive) {
+          currentResultsRef.current = hydratedResults;
           setResults(hydratedResults);
         }
         const storedUploads = Array.isArray(stored.uploads) ? stored.uploads : [];
@@ -411,6 +562,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       abortControllersRef.current.forEach((controller: AbortController) => controller.abort());
       retryTimersRef.current.forEach((timerId: number) => clearTimeout(timerId));
       retryTimersRef.current.clear();
+      clearBackendTransitionTimer();
       objectUrlMapRef.current.forEach((url: string) => URL.revokeObjectURL(url));
       objectUrlMapRef.current.clear();
       taskStartTimesRef.current.clear();
@@ -424,12 +576,15 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       prompt,
       concurrency,
       enableSound,
+      retryInterval,
+      retryLimit,
       results: serializeResults(results),
       uploads: serializeUploads(fileList),
       stats,
+      apiProfileId,
     };
     saveTaskState(storageKey, payload);
-  }, [prompt, concurrency, enableSound, results, stats, storageKey, hydrated, fileList, backendMode]);
+  }, [prompt, concurrency, enableSound, retryInterval, retryLimit, results, stats, storageKey, hydrated, fileList, backendMode, apiProfileId]);
 
   useEffect(() => {
     if (!backendMode) return;
@@ -456,7 +611,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
   useEffect(() => {
     if (!backendMode) return;
-    setIsGlobalLoading(results.some((result) => result.status === 'loading'));
+    setIsGlobalLoading(results.some((result) => isResultActive(result)));
   }, [backendMode, results]);
 
   useEffect(() => {
@@ -476,6 +631,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   useEffect(() => {
     collectedCollectionKeysRef.current.clear();
     requestContextByResultIdRef.current.clear();
+    pendingBackendGenerateSnapshotRef.current = null;
   }, [id]);
 
   useEffect(() => {
@@ -894,11 +1050,11 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     return { mimeType: match[1], data: normalizeBase64Payload(match[2]) };
   };
 
-  const resolveWebpQuality = () => {
-    if (typeof config.webpQuality !== 'number' || Number.isNaN(config.webpQuality)) {
+  const resolveWebpQuality = (profile: any) => {
+    if (typeof profile.webpQuality !== 'number' || Number.isNaN(profile.webpQuality)) {
       return null;
     }
-    return clampNumber(Math.round(config.webpQuality), 50, 100);
+    return clampNumber(Math.round(profile.webpQuality), 50, 100);
   };
 
   const convertDataUrlToWebp = (dataUrl: string, quality: number) =>
@@ -933,13 +1089,13 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       img.src = dataUrl;
     });
 
-  const maybeConvertToWebp = async (dataUrl: string) => {
+  const maybeConvertToWebp = async (dataUrl: string, profile: any) => {
     const { mimeType, data } = splitDataUrl(dataUrl);
     const normalized = normalizeBase64Payload(data);
     if (!mimeType || mimeType.toLowerCase() === 'image/webp') {
       return { mimeType: mimeType || 'image/png', data: normalized };
     }
-    const quality = resolveWebpQuality();
+    const quality = resolveWebpQuality(profile);
     if (!quality) {
       return { mimeType: mimeType || 'image/png', data: normalized };
     }
@@ -958,7 +1114,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     }
   };
 
-  const buildGeminiContents = async () => {
+  const buildGeminiContents = async (profile: any) => {
     const parts: Array<{ text?: string; inline_data?: { mime_type: string; data: string } }> = [];
     const promptText = promptRef.current.trim();
     if (promptText) {
@@ -967,7 +1123,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     for (const file of fileList) {
       if (!file.originFileObj) continue;
       const base64 = await getBase64(file.originFileObj);
-      const converted = await maybeConvertToWebp(base64);
+      const converted = await maybeConvertToWebp(base64, profile);
       const resolvedMime = converted.mimeType || file.type || 'image/png';
       const payload = normalizeBase64Payload(converted.data);
       parts.push({ inline_data: { mime_type: resolvedMime, data: payload } });
@@ -975,23 +1131,23 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     return [{ role: 'user', parts }];
   };
 
-  const buildGeminiGenerationConfig = () => {
+  const buildGeminiGenerationConfig = (profile: any) => {
     const generationConfig: Record<string, unknown> = {};
-    if (config.includeImageConfig) {
-      const imageSize = config.imageConfig?.imageSize || '2K';
-      const aspectRatio = config.imageConfig?.aspectRatio || 'auto';
+    if (profile.includeImageConfig) {
+      const imageSize = profile.imageConfig?.imageSize || '2K';
+      const aspectRatio = profile.imageConfig?.aspectRatio || 'auto';
       const imageConfig: Record<string, string> = { imageSize };
       if (aspectRatio && aspectRatio !== 'auto') {
         imageConfig.aspectRatio = aspectRatio;
       }
       generationConfig.imageConfig = imageConfig;
-      if (config.useResponseModalities) {
+      if (profile.useResponseModalities) {
         generationConfig.responseModalities = ['TEXT', 'IMAGE'];
       }
     }
-    if (config.includeThoughts) {
+    if (profile.includeThoughts) {
       const budget = clampNumber(
-        Math.round(typeof config.thinkingBudget === 'number' ? config.thinkingBudget : 128),
+        Math.round(typeof profile.thinkingBudget === 'number' ? profile.thinkingBudget : 128),
         0,
         8192,
       );
@@ -1003,9 +1159,9 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     return Object.keys(generationConfig).length > 0 ? generationConfig : null;
   };
 
-  const buildGeminiSafetySettings = () => {
-    if (!config.includeSafetySettings || !config.safety) return null;
-    const entries = Object.entries(config.safety).filter(
+  const buildGeminiSafetySettings = (profile: any) => {
+    if (!profile.includeSafetySettings || !profile.safety) return null;
+    const entries = Object.entries(profile.safety).filter(
       ([, threshold]) => threshold && threshold !== 'OFF',
     );
     if (entries.length === 0) return null;
@@ -1015,8 +1171,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     }));
   };
 
-  const mergeGeminiCustomJson = (payload: Record<string, unknown>) => {
-    const raw = typeof config.customJson === 'string' ? config.customJson.trim() : '';
+  const mergeGeminiCustomJson = (payload: Record<string, unknown>, profile: any) => {
+    const raw = typeof profile.customJson === 'string' ? profile.customJson.trim() : '';
     if (!raw) return payload;
     try {
       const custom = JSON.parse(raw);
@@ -1040,27 +1196,27 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     }
   };
 
-  const buildGeminiPayload = (contents: Array<Record<string, unknown>>) => {
+  const buildGeminiPayload = (contents: Array<Record<string, unknown>>, profile: any) => {
     const payload: Record<string, unknown> = { contents };
-    const generationConfig = buildGeminiGenerationConfig();
+    const generationConfig = buildGeminiGenerationConfig(profile);
     if (generationConfig) {
       payload.generationConfig = generationConfig;
     }
-    const safetySettings = buildGeminiSafetySettings();
+    const safetySettings = buildGeminiSafetySettings(profile);
     if (safetySettings) {
       payload.safetySettings = safetySettings;
     }
-    return mergeGeminiCustomJson(payload);
+    return mergeGeminiCustomJson(payload, profile);
   };
 
-  const buildGeminiRequest = () => {
-    const apiFormat = config.apiFormat || 'openai';
+  const buildGeminiRequest = (profile: any) => {
+    const apiFormat = profile.apiFormat || 'openai';
     const format = apiFormat === 'vertex' ? 'vertex' : 'gemini';
-    const apiUrl = resolveApiUrl(config.apiUrl, format);
+    const apiUrl = resolveApiUrl(profile.apiUrl, format);
     const baseInfo = normalizeApiBase(apiUrl);
     const baseOrigin = baseInfo.origin || apiUrl.replace(/\/+$/, '');
     const versionFallback = format === 'vertex' ? 'v1beta1' : 'v1beta';
-    const version = resolveApiVersion(apiUrl, config.apiVersion, versionFallback);
+    const version = resolveApiVersion(apiUrl, profile.apiVersion, versionFallback);
     const hasVersion = Boolean(inferApiVersionFromUrl(apiUrl));
     const segments = [...baseInfo.segments];
 
@@ -1073,7 +1229,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       }
     }
 
-    const modelValue = config.model.trim();
+    const modelValue = (profile.model || '').trim();
     if (!modelValue) {
       throw new Error('请填写模型名称');
     }
@@ -1120,9 +1276,9 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
     if (format === 'vertex') {
       const projectId =
-        config.vertexProjectId?.trim() || extractVertexProjectId(apiUrl) || '';
-      const location = config.vertexLocation?.trim() || 'us-central1';
-      const publisher = config.vertexPublisher?.trim() || 'google';
+        profile.vertexProjectId?.trim() || extractVertexProjectId(apiUrl) || '';
+      const location = profile.vertexLocation?.trim() || 'us-central1';
+      const publisher = profile.vertexPublisher?.trim() || 'google';
       const hasProjectsMarker = segments.includes('projects');
       const useVertexMarkers = Boolean(projectId || hasProjectsMarker || modelHasProjectPath);
 
@@ -1156,9 +1312,9 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         ? baseInfo.host === 'aiplatform.googleapis.com'
         : baseInfo.host === 'generativelanguage.googleapis.com';
     if (isOfficial) {
-      url += `${url.includes('?') ? '&' : '?'}key=${encodeURIComponent(config.apiKey)}`;
+      url += `${url.includes('?') ? '&' : '?'}key=${encodeURIComponent(profile.apiKey)}`;
     } else {
-      headers.Authorization = `Bearer ${config.apiKey}`;
+      headers.Authorization = `Bearer ${profile.apiKey}`;
     }
     return { url, headers };
   };
@@ -1297,18 +1453,22 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   };
 
   const updateResult = (id: string, updates: Partial<SubTaskResult>) => {
-    setResults((prev: SubTaskResult[]) => prev.map((r: SubTaskResult) => {
-      if (r.id !== id) return r;
-      const next = { ...r, ...updates };
-      if (Object.prototype.hasOwnProperty.call(updates, 'displayUrl')) {
-        if (next.displayUrl && next.displayUrl.startsWith('blob:')) {
-          registerObjectUrl(id, next.displayUrl);
-        } else {
-          clearObjectUrl(id);
+    setResults((prev: SubTaskResult[]) => {
+      const updated = prev.map((r: SubTaskResult) => {
+        if (r.id !== id) return r;
+        const next = { ...r, ...updates };
+        if (Object.prototype.hasOwnProperty.call(updates, 'displayUrl')) {
+          if (next.displayUrl && next.displayUrl.startsWith('blob:')) {
+            registerObjectUrl(id, next.displayUrl);
+          } else {
+            clearObjectUrl(id);
+          }
         }
-      }
-      return next;
-    }));
+        return next;
+      });
+      currentResultsRef.current = updated;
+      return updated;
+    });
   };
 
   const updateStats = (type: 'request' | 'success' | 'fail', duration?: number) => {
@@ -1332,6 +1492,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     ...task,
     status: 'loading',
     error: undefined,
+    autoRetry: true,
     displayUrl: undefined,
     localKey: undefined,
     sourceUrl: undefined,
@@ -1342,8 +1503,13 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     retryCount: 0
   });
 
+  const getActiveProfile = () => {
+    return config.apiProfiles?.find(p => p.id === apiProfileId) || config;
+  };
+
   const handleGenerate = async () => {
-    if (!config.apiKey) {
+    const profile = getActiveProfile();
+    if (!profile.apiKey) {
       message.error('请先配置 API Key');
       return;
     }
@@ -1359,28 +1525,23 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       }
       setIsGlobalLoading(true);
       const requestSnapshot = buildCollectionRequestSnapshot(prompt);
-      const prevStatuses = new Map(results.map((item) => [item.id, item.status]));
       try {
         await patchBackendTask(id, {
           prompt,
           concurrency,
           enableSound,
+          retryInterval,
+          retryLimit,
+          apiProfileId,
           uploads: serializeUploads(fileList),
         });
-        const nextState = await generateBackendTask(id);
-        nextState.results.forEach((result) => {
-          const prevStatus = prevStatuses.get(result.id);
-          const isInFlight = result.status === 'loading' || result.status === 'pending';
-          if (!prevStatus || (isInFlight && prevStatus !== 'loading' && prevStatus !== 'pending')) {
-            requestContextByResultIdRef.current.set(result.id, requestSnapshot);
-          }
-        });
-        applyBackendTaskState(nextState);
+        pendingBackendGenerateSnapshotRef.current = requestSnapshot;
+        await generateBackendTask(id);
       } catch (err) {
-        console.error(err);
-        message.error('后端生成失败，请检查服务状态');
-      } finally {
+        pendingBackendGenerateSnapshotRef.current = null;
         setIsGlobalLoading(false);
+        console.error(err);
+        message.error(formatUnknownErrorMessage(err, '后端生成失败，请检查服务状态'));
       }
       return;
     }
@@ -1402,18 +1563,17 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     const newSubTasks: SubTaskResult[] = Array.from({ length: numNewTasks }).map(() => ({
       id: uuidv4(),
       status: 'loading',
+      autoRetry: true,
       retryCount: 0,
       startTime,
       savedLocal: false
     }));
 
     const resetTasks = tasksToReuse.map(task => resetTaskForGenerate(task, startTime));
-    setResults(() => {
-      if (newSubTasks.length > 0) {
-        return [...newSubTasks, ...resetTasks];
-      }
-      return resetTasks;
-    });
+    const nextResults =
+      newSubTasks.length > 0 ? [...newSubTasks, ...resetTasks] : resetTasks;
+    currentResultsRef.current = nextResults;
+    setResults(nextResults);
 
     // 启动所有任务（新的 + 复用的）
     [...newSubTasks, ...resetTasks].forEach(task => {
@@ -1425,71 +1585,50 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
   const handleRetrySingle = (subTaskId: string) => {
     if (backendMode) {
-      setIsGlobalLoading(true);
       requestContextByResultIdRef.current.set(
         subTaskId,
         buildCollectionRequestSnapshot(prompt),
       );
+      clearBackendTransitionTimer(subTaskId);
+      updateResult(subTaskId, {
+        status: 'loading',
+        error: undefined,
+        autoRetry: true,
+        displayUrl: undefined,
+        localKey: undefined,
+        sourceUrl: undefined,
+        savedLocal: false,
+        startTime: Date.now(),
+        endTime: undefined,
+        duration: undefined,
+      });
       void retryBackendSubTask(id, subTaskId)
-        .then((nextState) => {
-          applyBackendTaskState(nextState);
-        })
         .catch((err) => {
+          updateResult(subTaskId, {
+            status: 'error',
+            error: formatUnknownErrorMessage(err, '后端重试失败'),
+            autoRetry: false,
+          });
           console.error(err);
-          message.error('后端重试失败');
-        })
-        .finally(() => {
-          setIsGlobalLoading(false);
+          message.error(formatUnknownErrorMessage(err, '后端重试失败'));
         });
       return;
     }
     clearRetryTimer(subTaskId);
-    updateResult(subTaskId, { status: 'loading', error: undefined, displayUrl: undefined, localKey: undefined, sourceUrl: undefined, savedLocal: false, startTime: Date.now() });
+    updateResult(subTaskId, { status: 'loading', error: undefined, autoRetry: true, displayUrl: undefined, localKey: undefined, sourceUrl: undefined, savedLocal: false, startTime: Date.now() });
     taskStartTimesRef.current.set(subTaskId, Date.now());
     isRetryingRef.current.set(subTaskId, true);
     performRequest(subTaskId);
   };
 
-  const handleResumeSingle = (subTaskId: string) => {
-    if (backendMode) {
-      requestContextByResultIdRef.current.set(
-        subTaskId,
-        buildCollectionRequestSnapshot(prompt),
-      );
-      void retryBackendSubTask(id, subTaskId)
-        .then((nextState) => {
-          applyBackendTaskState(nextState);
-        })
-        .catch((err) => {
-          console.error(err);
-          message.error('后端继续失败');
-        });
-      return;
-    }
-    isRetryingRef.current.set(subTaskId, true);
-    const hasActiveRequest = abortControllersRef.current.has(subTaskId);
-    const hasPendingRetry = retryTimersRef.current.has(subTaskId);
-    const existingStartTime = taskStartTimesRef.current.get(subTaskId);
-    const nextStartTime = existingStartTime ?? Date.now();
-    if (!existingStartTime) {
-      taskStartTimesRef.current.set(subTaskId, nextStartTime);
-    }
-    updateResult(subTaskId, { status: 'loading', error: undefined, startTime: nextStartTime });
-    if (hasActiveRequest || hasPendingRetry) {
-      return;
-    }
-    performRequest(subTaskId);
-  };
-
   const handleStopSingle = (subTaskId: string) => {
     if (backendMode) {
+      clearBackendTransitionTimer(subTaskId);
+      updateResult(subTaskId, { status: 'error', error: '已暂停重试', autoRetry: false });
       void stopBackendSubTask(id, subTaskId, 'pause')
-        .then((nextState) => {
-          applyBackendTaskState(nextState);
-        })
         .catch((err) => {
           console.error(err);
-          message.error('后端停止失败');
+          message.error(formatUnknownErrorMessage(err, '后端停止失败'));
         });
       return;
     }
@@ -1498,7 +1637,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     // 如果需要强制停止请求，可以调用 abortControllersRef.current.get(subTaskId)?.abort();
     // 根据需求：停止新的请求，如果有图返回还是要显示的。所以不 abort。
     // 更新状态显示为“暂停重试”
-    updateResult(subTaskId, { status: 'error', error: '已暂停重试' });
+    updateResult(subTaskId, { status: 'error', error: '已暂停重试', autoRetry: false });
   };
 
   const performRequest = async (subTaskId: string) => {
@@ -1514,17 +1653,18 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     requestContextByResultIdRef.current.set(subTaskId, requestSnapshot);
 
     try {
-      const apiFormat = config.apiFormat || 'openai';
+      const profile = getActiveProfile();
+      const apiFormat = profile.apiFormat || 'openai';
       const hasImage = fileList.length > 0;
       let imageUrl: string | null = null;
 
       if (apiFormat === 'openai') {
-        const apiUrl = resolveApiUrl(config.apiUrl, 'openai');
+        const apiUrl = resolveApiUrl(profile.apiUrl, 'openai');
         const baseInfo = normalizeApiBase(apiUrl);
         const basePath = baseInfo.origin
           ? `${baseInfo.origin}${baseInfo.segments.length ? `/${baseInfo.segments.join('/')}` : ''}`
           : apiUrl.replace(/\/+$/, '');
-        const version = resolveApiVersion(apiUrl, config.apiVersion, 'v1');
+        const version = resolveApiVersion(apiUrl, profile.apiVersion, 'v1');
         const hasVersion = Boolean(inferApiVersionFromUrl(apiUrl));
         const openAiBase = hasVersion ? basePath : `${basePath}/${version}`;
         const chatUrl = openAiBase.endsWith('/chat/completions')
@@ -1554,19 +1694,26 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
           content,
         });
         const headers = {
-          'Authorization': `Bearer ${config.apiKey}`,
-          'x-api-key': config.apiKey,
+          'Authorization': `Bearer ${profile.apiKey}`,
+          'x-api-key': profile.apiKey,
         };
 
         if (config.stream) {
           const fetchResponse = await fetch(chatUrl, {
             method: 'POST',
             headers: { ...headers, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: config.model, messages, stream: true }),
+            body: JSON.stringify({ model: profile.model, messages, stream: true }),
             signal: controller.signal,
           });
 
-          if (!fetchResponse.ok) throw new Error(fetchResponse.statusText);
+          if (!fetchResponse.ok) {
+            throw new Error(
+              await formatResponseErrorMessage(
+                fetchResponse,
+                fetchResponse.statusText || '请求失败',
+              ),
+            );
+          }
 
           const reader = fetchResponse.body?.getReader();
           const decoder = new TextDecoder();
@@ -1608,37 +1755,44 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         } else {
           const response = await axios.post(
             chatUrl,
-            { model: config.model, messages, stream: false },
+            { model: profile.model, messages, stream: false },
             { headers: { ...headers, 'Content-Type': 'application/json' }, signal: controller.signal }
           );
           imageUrl = resolveImageFromResponse(response.data);
         }
       } else {
-        const contents = await buildGeminiContents();
-        const { url, headers } = buildGeminiRequest();
-        const payload = buildGeminiPayload(contents);
+        const contents = await buildGeminiContents(profile);
+        const { url, headers } = buildGeminiRequest(profile);
+        const payload = buildGeminiPayload(contents, profile);
         const response = await fetch(url, {
           method: 'POST',
           headers,
           body: JSON.stringify(payload),
           signal: controller.signal,
         });
-        const data = config.stream ? await readGeminiStream(response) : await response.json();
         if (!response.ok) {
-          const errorMessage =
-            data?.error?.message ||
-            (typeof data === 'string' ? data : '') ||
-            response.statusText;
-          throw new Error(errorMessage);
+          throw new Error(
+            await formatResponseErrorMessage(response, response.statusText || '请求失败'),
+          );
         }
+        const data = config.stream ? await readGeminiStream(response) : await response.json();
         imageUrl = resolveImageFromResponse(data);
       }
       
       if (imageUrl) {
+        const currentTask = currentResultsRef.current.find(r => r.id === subTaskId);
+        if (currentTask?.status === 'error') {
+          const paperEl = document.getElementById(`paper-${subTaskId}`);
+          if (paperEl) {
+            paperEl.classList.add('polaroid-dropping');
+            await new Promise(resolve => setTimeout(resolve, 400));
+          }
+        }
+
         const endTime = Date.now();
         const duration = endTime - startTime;
         const { displayUrl, localKey } = await persistImageLocally(imageUrl, subTaskId);
-        updateResult(subTaskId, { status: 'success', displayUrl, localKey, sourceUrl: imageUrl, savedLocal: false, endTime, duration });
+        updateResult(subTaskId, { status: 'success', error: undefined, autoRetry: false, displayUrl, localKey, sourceUrl: imageUrl, savedLocal: false, endTime, duration });
         updateStats('success', duration);
         
         if (config.enableCollection && onCollect) {
@@ -1666,34 +1820,52 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       }
 
       console.error('Generation error:', err);
-      const errorMessage = err.response?.data?.error?.message || err.message || '未知错误';
+      const errorMessage = formatUnknownErrorMessage(err, '未知错误');
       updateStats('fail');
       
       const shouldRetry = isRetryingRef.current.get(subTaskId);
+      const { interval, limit } = retrySettingsRef.current;
+      const currentTask = currentResultsRef.current.find(r => r.id === subTaskId);
+      const currentRetryCount = currentTask?.retryCount || 0;
+      const canRetry = limit === -1 || currentRetryCount < limit;
       
-      if (shouldRetry) {
-        setResults(prev => prev.map(r => {
-          if (r.id !== subTaskId) return r;
-          return {
-            ...r,
-            status: 'loading',
-            error: `${errorMessage} (1s后重试...)`,
-            retryCount: (r.retryCount || 0) + 1
-          };
-        }));
+      if (currentTask?.status === 'error') {
+        const paperEl = document.getElementById(`paper-${subTaskId}`);
+        if (paperEl) {
+          paperEl.classList.add('polaroid-dropping');
+          await new Promise(resolve => setTimeout(resolve, 400));
+        }
+      }
+
+      if (shouldRetry && canRetry) {
+        setResults(prev => {
+          const updated = prev.map<SubTaskResult>((r) => {
+            if (r.id !== subTaskId) return r;
+            return {
+              ...r,
+              status: 'error',
+              error: `${errorMessage} (${interval / 1000}s后重试...)`,
+              autoRetry: true,
+              retryCount: currentRetryCount + 1
+            };
+          });
+          currentResultsRef.current = updated;
+          return updated;
+        });
 
         clearRetryTimer(subTaskId);
         const timerId = window.setTimeout(() => {
           clearRetryTimer(subTaskId);
-        if (isRetryingRef.current.get(subTaskId)) { 
-          performRequest(subTaskId);
-        } else {
-          updateResult(subTaskId, { status: 'error', error: '已暂停重试' });
-        }
-      }, 1000);
+          if (isRetryingRef.current.get(subTaskId)) { 
+            performRequest(subTaskId);
+          } else {
+            updateResult(subTaskId, { status: 'error', error: '已暂停重试', autoRetry: false });
+          }
+        }, interval);
         retryTimersRef.current.set(subTaskId, timerId);
       } else {
-        updateResult(subTaskId, { status: 'error', error: errorMessage });
+        isRetryingRef.current.set(subTaskId, false);
+        updateResult(subTaskId, { status: 'error', error: errorMessage, autoRetry: false, retryCount: currentRetryCount + 1 });
       }
     } finally {
       abortControllersRef.current.delete(subTaskId);
@@ -1705,17 +1877,25 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
   const handleStopAll = () => {
     if (backendMode) {
-      setIsGlobalLoading(true);
+      clearBackendTransitionTimer();
+      setResults((prev) => {
+        const updated = prev.map<SubTaskResult>((item) => {
+          if (!isResultActive(item)) return item;
+          return {
+            ...item,
+            status: 'error',
+            error: '已停止',
+            autoRetry: false,
+            endTime: Date.now(),
+          };
+        });
+        currentResultsRef.current = updated;
+        return updated;
+      });
       void stopBackendSubTask(id, undefined, 'abort')
-        .then((nextState) => {
-          applyBackendTaskState(nextState);
-        })
         .catch((err) => {
           console.error(err);
-          message.error('后端停止失败');
-        })
-        .finally(() => {
-          setIsGlobalLoading(false);
+          message.error(formatUnknownErrorMessage(err, '后端停止失败'));
         });
       return;
     }
@@ -1725,10 +1905,14 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       abortSubTaskRequest(result.id);
     });
     setResults((prev) =>
-      prev.map((item) => {
-        if (item.status !== 'loading') return item;
-        return { ...item, status: 'error', error: '已停止', endTime: Date.now() };
-      }),
+      {
+        const updated = prev.map<SubTaskResult>((item) => {
+        if (!isResultActive(item)) return item;
+        return { ...item, status: 'error', error: '已停止', autoRetry: false, endTime: Date.now() };
+        });
+        currentResultsRef.current = updated;
+        return updated;
+      },
     );
     message.info('已停止所有请求');
     setIsGlobalLoading(false);
@@ -1862,7 +2046,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
   const averageTime = stats.successCount > 0 
     ? formatDuration(stats.totalTime / stats.successCount)
-    : '0.0s';
+    : '0s';
   
   const fastestTimeStr = formatDuration(stats.fastestTime);
   const slowestTimeStr = formatDuration(stats.slowestTime);
@@ -1920,12 +2104,17 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       {/* Header */}
       <div style={{ 
         padding: '12px 16px', 
-        borderBottom: '1px solid #F0F0F0',
+        borderBottom: '2px dashed #FFF0F3',
         display: 'flex',
         justifyContent: 'space-between',
         alignItems: 'center',
-        background: '#fff'
+        background: '#fff',
+        position: 'relative',
+        overflow: 'hidden'
       }}>
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" style={{ position: 'absolute', top: -2, right: 30, opacity: 0.8, transform: 'rotate(15deg)' }}>
+          <path d="M12 2L14.4 9.6L22 12L14.4 14.4L12 22L9.6 14.4L2 12L9.6 9.6L12 2Z" fill="#FFE5A0"/>
+        </svg>
         <Space>
           <div 
             style={{ 
@@ -1951,6 +2140,42 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
             <PictureFilled style={{ fontSize: 14 }} />
           </div>
           <Text strong style={{ fontSize: 14, color: '#665555' }}>任务 #{id.slice(0, 6).toUpperCase()}</Text>
+          <div 
+            className={isGlobalLoading ? 'api-select-running' : ''}
+            style={{
+              background: isGlobalLoading ? '#F6FFED' : '#FFF8FA',
+              borderRadius: 12,
+              padding: '0',
+              border: `1px solid ${isGlobalLoading ? '#B7EB8F' : '#FFE5EA'}`,
+              display: 'flex',
+              alignItems: 'center',
+              marginLeft: 4,
+              height: 24,
+              transition: 'all 0.3s ease',
+            }}
+          >
+            <div 
+              className={isGlobalLoading ? 'api-select-dot-running' : ''}
+              style={{ 
+                width: 6, 
+                height: 6, 
+                borderRadius: '50%', 
+                background: isGlobalLoading ? '#52C41A' : '#FF9EB5', 
+                margin: '0 0 0 8px',
+                transition: 'all 0.3s ease'
+              }} 
+            />
+            <Select
+              size="small"
+              value={apiProfileId}
+              onChange={(val: string) => setApiProfileId(val)}
+              options={(config.apiProfiles || [{ id: 'default', name: '默认配置' }]).map(p => ({ label: p.name, value: p.id }))}
+              style={{ minWidth: 80 }}
+              variant="borderless"
+              popupMatchSelectWidth={false}
+              dropdownStyle={{ minWidth: 120, borderRadius: 8 }}
+            />
+          </div>
         </Space>
         <Button 
           type="text" 
@@ -1966,7 +2191,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       <div style={{ 
         padding: '12px 16px', 
         background: '#FAFAFA',
-        borderBottom: '1px solid #F0F0F0',
+        borderBottom: '2px dashed #FFF0F3',
         fontSize: 12
       }}>
         <div style={{ 
@@ -2001,43 +2226,38 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
           </div>
         </div>
       </div>
-      <Progress 
-        percent={successRate} 
-        showInfo={false} 
-        strokeColor={{ '0%': '#FFC107', '100%': '#4CAF50' }} 
-        trailColor="transparent"
-        size="small"
-        strokeLinecap="square"
-        style={{ margin: 0, lineHeight: 0, height: 2 }}
-      />
 
       {/* Input Area */}
-      <div style={{ padding: '16px' }}>
-        <div style={{ 
-          background: '#FFF0F3', 
-          borderRadius: 16, 
-          padding: 4,
-          border: '1px solid transparent',
-          transition: 'all 0.3s',
-        }}
-        onFocus={(e) => e.currentTarget.style.borderColor = '#FF9EB5'}
-        onBlur={(e) => e.currentTarget.style.borderColor = 'transparent'}
-        >
-          <TextArea 
-            placeholder="在此描述您的想象..." 
-            value={prompt} 
-            onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => handlePromptChange(e.target.value)}
-            onFocus={handlePromptFocus}
-            onBlur={handlePromptBlur}
-            onPaste={handlePromptPaste}
-            autoSize={{ minRows: 3, maxRows: 12 }}
-            variant="borderless"
-            style={{ padding: '12px', fontSize: 14, resize: 'vertical', background: 'transparent', color: '#665555' }}
-          />
+      <div style={{ padding: '16px', background: 'linear-gradient(180deg, #FAFAFA 0%, #fff 100%)' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {/* 独立便签输入框 */}
+          <div className="sticky-note-container">
+            <div className="sticky-note-fold-effect top" />
+            <div className={`sticky-note-inner-wrap ${isGlobalLoading ? 'rolling' : ''}`} onAnimationEnd={(e) => {
+              if (e.animationName === 'conveyor-roll-wrap-down') {
+                e.currentTarget.classList.remove('rolling');
+              }
+            }}>
+              {/* 背景虚线层通过 CSS top/bottom 扩展，这里不需要再动态计算高度，让它自然延伸 */}
+              <div className="sticky-note-bg-layer" />
+              <TextArea 
+                className="sticky-note-textarea"
+                placeholder="在此描述您的想象..." 
+                value={prompt} 
+                onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => handlePromptChange(e.target.value)}
+                onFocus={handlePromptFocus}
+                onBlur={handlePromptBlur}
+                onPaste={handlePromptPaste}
+                autoSize={{ minRows: 2, maxRows: 15 }}
+                variant="borderless"
+              />
+            </div>
+            <div className="sticky-note-fold-effect bottom" />
+          </div>
           
           {/* 图片预览区域 */}
           {fileList.length > 0 && (
-            <div style={{ padding: '8px 12px 16px', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <div style={{ padding: '0 4px', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               {fileList.map((file, index) => (
                 <div key={file.uid} style={{ position: 'relative', width: 60, height: 60 }}>
                   <Image
@@ -2067,14 +2287,16 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
             </div>
           )}
 
-          <div style={{ 
-            padding: '8px 12px', 
-            display: 'flex', 
-            justifyContent: 'space-between', 
-            alignItems: 'center',
-            flexWrap: 'wrap',
-            gap: 8
-          }}>
+        {/* 工具栏 */}
+        <div style={{ 
+          display: 'flex', 
+          justifyContent: 'space-between', 
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: 8,
+          padding: '0 4px',
+          marginTop: '4px'
+        }}>
             <Space size={8}>
               <Upload
                 fileList={fileList}
@@ -2090,14 +2312,15 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                     style={fileList.length > 0 ? { 
                       background: '#FF9EB5', color: '#fff', border: 'none' 
                     } : { 
-                      background: '#fff', color: '#998888', border: 'none' 
+                      background: '#fff', color: '#998888', border: '1px solid #E8E8E8' 
                     }}
                   />
                 </Tooltip>
               </Upload>
 
-              <Space size={4} style={{ background: '#fff', padding: '2px 8px', borderRadius: 12, display: 'flex', alignItems: 'center' }}>
-                <Text type="secondary" style={{ fontSize: 10, whiteSpace: 'nowrap' }}>并发</Text>
+              <Space size={4} style={{ background: '#fff', padding: '2px 8px', borderRadius: 16, display: 'flex', alignItems: 'center', border: '1px solid #E8E8E8', height: '24px' }}>
+                <Text style={{ fontSize: 10, whiteSpace: 'nowrap', color: '#998888' }}>并发</Text>
+                <div style={{ width: 1, height: 10, background: '#E8E8E8', margin: '0 2px' }} />
                 <input 
                   type="number"
                   min={1} 
@@ -2105,10 +2328,10 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                   onChange={(e) => handleConcurrencyInputChange(e.target.value)} 
                   onBlur={handleConcurrencyInputBlur}
                   style={{ 
-                    width: 32, 
+                    width: 24, 
                     border: 'none', 
                     textAlign: 'center', 
-                    color: '#665555', 
+                    color: '#998888', 
                     fontWeight: 700,
                     background: 'transparent',
                     outline: 'none',
@@ -2119,13 +2342,67 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                 />
               </Space>
 
-              <Button 
-                type="text" 
-                size="small" 
-                icon={enableSound ? <BellFilled /> : <BellOutlined />} 
-                style={{ color: enableSound ? '#FF9EB5' : '#D0C0C0' }}
-                onClick={() => setEnableSound(!enableSound)}
-              />
+              <Tooltip title="声音提醒">
+                <Button 
+                  size="small" 
+                  icon={enableSound ? <BellFilled /> : <BellOutlined />} 
+                  style={{ 
+                    color: enableSound ? '#FF9EB5' : '#998888',
+                    background: '#fff',
+                    border: enableSound ? '1px solid #FF9EB5' : '1px solid #E8E8E8'
+                  }}
+                  onClick={() => setEnableSound(!enableSound)}
+                />
+              </Tooltip>
+
+              <Popover 
+                content={
+                  <Space direction="vertical" size={12} style={{ width: 160 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>重试间隔 (秒)</Text>
+                      <InputNumber 
+                        size="small" 
+                        min={0} 
+                        step={0.1}
+                        bordered={false}
+                        value={retryInterval / 1000} 
+                        onChange={(val) => setRetryInterval(Math.max(0, val || 0) * 1000)} 
+                        style={{ width: 60 }} 
+                      />
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>重试次数</Text>
+                      <InputNumber 
+                        size="small" 
+                        min={-1}
+                        step={1}
+                        bordered={false}
+                        value={retryLimit} 
+                        onChange={(val) => setRetryLimit(val ?? -1)} 
+                        style={{ width: 60 }} 
+                      />
+                    </div>
+                    <Text type="secondary" style={{ fontSize: 10, lineHeight: 1.2 }}>
+                      * -1表示无限重试，0表示不重试
+                    </Text>
+                  </Space>
+                }
+                title={<Text strong style={{ fontSize: 13, color: '#665555' }}>任务设置</Text>}
+                trigger="click"
+                placement="bottom"
+              >
+                <Tooltip title="任务设置">
+                  <Button 
+                    size="small" 
+                    icon={<SettingFilled />} 
+                    style={{ 
+                      color: '#998888',
+                      background: '#fff',
+                      border: '1px solid #E8E8E8'
+                    }}
+                  />
+                </Tooltip>
+              </Popover>
             </Space>
 
             {isGlobalLoading ? (
@@ -2180,164 +2457,188 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
             <div className="mobile-compact-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
               {results.map((result: SubTaskResult) => {
                 const imageSrc = getPreferredImageSrc(result);
+                // 仅当状态为 success 或者是 error 时显示相纸内容，loading 状态显示出纸口内部的等待效果
+                
                 return (
-                <div key={result.id} style={{ 
-                  position: 'relative', 
-                  paddingTop: '100%', 
-                  borderRadius: 12, 
-                  overflow: 'hidden',
-                  background: '#F8F9FA',
-                  border: '1px solid #eee',
-                }}>
-                  <div style={{ 
-                    position: 'absolute', 
-                    top: 0, left: 0, right: 0, bottom: 0,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center'
-                  }}>
-                    {result.status === 'success' && imageSrc ? (
-                      <>
-                        <Image
-                          src={imageSrc}
-                          alt="Generated"
-                          style={{ width: '100%', height: '100%', objectFit: 'cover', position: 'absolute', top: 0, left: 0 }}
-                          wrapperStyle={{ width: '100%', height: '100%' }}
-                        />
-                        {result.duration && (
-                          <div style={{
-                            position: 'absolute',
-                            top: 8,
-                            left: 8,
-                            background: 'rgba(0,0,0,0.6)',
-                            color: '#fff',
-                            padding: '2px 6px',
-                            borderRadius: 4,
-                            fontSize: 10,
-                            backdropFilter: 'blur(4px)',
-                            zIndex: 2
-                          }}>
-                            {formatDuration(result.duration)}
-                          </div>
-                        )}
-                        <div style={{
-                          position: 'absolute',
-                          bottom: 8,
-                          right: 8,
-                          display: 'flex',
-                          gap: 8
-                        }}>
-                          <div style={{
-                            background: 'rgba(255,255,255,0.9)',
-                            backdropFilter: 'blur(4px)',
-                            borderRadius: '50%',
-                            width: 28,
-                            height: 28,
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-                            cursor: 'pointer'
-                          }}
-                          onClick={() => handleRetrySingle(result.id)}
-                          >
-                            <ReloadOutlined style={{ color: '#665555' }} />
-                          </div>
-                          <div style={{
-                            background: 'rgba(255,255,255,0.9)',
-                            backdropFilter: 'blur(4px)',
-                            borderRadius: '50%',
-                            width: 28,
-                            height: 28,
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-                            cursor: 'pointer'
-                          }}>
-                            <a
-                              href={imageSrc}
-                              download={`image-${result.id}.png`}
-                              onClick={() => {
-                                void saveImageToProject(result);
-                              }}
-                              style={{ color: '#665555', display: 'flex' }}
-                            >
-                              <DownloadOutlined />
-                            </a>
-                          </div>
-                        </div>
-                      </>
-                    ) : (
-                      <div style={{ textAlign: 'center', padding: 8, width: '100%', position: 'relative', zIndex: 3 }}>
-                        {result.status === 'loading' ? (
+                  <div key={result.id} className="polaroid-printer">
+                    <div className="polaroid-slot-outer">
+                      <div className="polaroid-slot-inner"></div>
+                    </div>
+                    
+                    <div className="polaroid-paper-container">
+                      {result.status === 'loading' ? (
+                        <div style={{ textAlign: 'center', padding: '40px 8px', marginTop: 20, width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
                           <Space direction="vertical" size={8}>
                             <Spin indicator={<LoadingOutlined style={{ fontSize: 24, color: '#FF9EB5' }} spin />} />
                             <Text type="secondary" style={{ fontSize: 10, fontWeight: 600 }}>
                               {result.retryCount > 0 ? `重试 (${result.retryCount})...` : '生成中...'}
                             </Text>
                           </Space>
-                        ) : (
-                          <Space direction="vertical" align="center" size={8}>
-                            <CloseCircleFilled style={{ fontSize: 20, color: '#FF5252' }} />
-                            <Space>
-                              {result.error === '已暂停重试' ? (
-                                <Button 
-                                  size="small" 
-                                  icon={<PlayCircleFilled />} 
-                                  onClick={() => handleResumeSingle(result.id)}
-                                  style={{ fontSize: 10, height: 24, padding: '0 8px' }}
-                                >继续</Button>
+                          <div style={{ marginTop: 12 }}>
+                            <Button
+                              type="text"
+                              size="small"
+                              danger
+                              icon={<PauseCircleFilled />}
+                              onClick={() => handleStopSingle(result.id)}
+                              style={{ background: 'rgba(255,255,255,0.8)', borderRadius: '50%', width: 32, height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 8px rgba(255,82,82,0.2)' }}
+                            />
+                          </div>
+                        </div>
+                      ) : (
+                        <div id={`paper-${result.id}`} key={`paper-${result.id}-${result.retryCount || 0}`} className={`polaroid-paper ${result.status === 'error' ? 'error-state' : ''}`}>
+                          {/* 相纸图片区域 */}
+                          <div style={{ 
+                            position: 'relative', 
+                            paddingTop: '114.28%', /* 8:7 比例 (7/8 = 0.875) 修正为竖屏 8:7 即高8宽7, h/w = 8/7 = 114.28% */ 
+                            background: result.status === 'error' ? '#FFD1DC' : '#000',
+                            width: '100%',
+                            overflow: 'hidden',
+                            boxShadow: 'inset 0 2px 6px rgba(0,0,0,0.1)'
+                          }}>
+                            <div style={{ 
+                              position: 'absolute', 
+                              top: 0, left: 0, right: 0, bottom: 0,
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center'
+                            }}>
+                              {result.status === 'success' && imageSrc ? (
+                                <>
+                                  <Image
+                                    src={imageSrc}
+                                    alt="Generated"
+                                    style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                                    wrapperStyle={{ width: '100%', height: '100%' }}
+                                  />
+                                  {result.duration && (
+                                    <div style={{
+                                      position: 'absolute',
+                                      bottom: 4,
+                                      right: 4,
+                                      color: 'rgba(255,255,255,0.9)',
+                                      fontSize: '11px',
+                                      fontFamily: 'monospace',
+                                      textShadow: '1px 1px 0 rgba(0,0,0,0.8), -1px -1px 0 rgba(0,0,0,0.8), 1px -1px 0 rgba(0,0,0,0.8), -1px 1px 0 rgba(0,0,0,0.8), 0px 2px 4px rgba(0,0,0,0.5)',
+                                      zIndex: 1,
+                                      pointerEvents: 'none',
+                                      letterSpacing: '0.5px',
+                                      fontWeight: 600
+                                    }}>
+                                      {formatDuration(result.duration)}
+                                    </div>
+                                  )}
+                                </>
                               ) : (
-                                <Button 
-                                  size="small" 
-                                  icon={<ReloadOutlined />} 
-                                  onClick={() => handleRetrySingle(result.id)}
-                                  style={{ fontSize: 10, height: 24, padding: '0 8px' }}
-                                >重试</Button>
+                                <div style={{ textAlign: 'center', padding: 16 }}>
+                                  <CloseCircleFilled style={{ fontSize: 32, color: '#FF5252', marginBottom: 8 }} />
+                                  <div style={{ color: '#FF5252', fontSize: 12, fontWeight: 600, wordBreak: 'break-word', maxHeight: 80, overflow: 'auto' }}>
+                                    {result.error || '生成失败'}
+                                  </div>
+                                </div>
                               )}
-                            </Space>
-                          </Space>
-                        )}
-                      </div>
-                    )}
-                    
-                    {/* 错误信息浮层 */}
-                    {result.error && result.status !== 'success' && (
-                      <div style={{
-                        position: 'absolute',
-                        top: 0, left: 0, right: 0,
-                        background: 'rgba(255, 82, 82, 0.9)',
-                        color: '#fff',
-                        padding: '4px 8px',
-                        fontSize: 10,
-                        textAlign: 'center',
-                        zIndex: 2
-                      }}>
-                        {result.error}
-                      </div>
-                    )}
+                            </div>
+                          </div>
+                          
+                          {/* 相纸底部信息区域 */}
+                          <div style={{ 
+                            marginTop: 8, 
+                            display: 'flex', 
+                            justifyContent: 'space-between', 
+                            alignItems: 'center',
+                            height: 24,
+                            padding: '0 2px'
+                          }}>
+                            <div style={{ 
+                              display: 'flex', 
+                              alignItems: 'center',
+                              height: '100%'
+                            }}>
+                              <Text style={{ 
+                                fontSize: 12, 
+                                fontFamily: "'ZCOOL KuaiLe', cursive", 
+                                color: '#998888',
+                                letterSpacing: '1px',
+                                display: 'inline-block',
+                                lineHeight: 1
+                              }}>
+                                moe atelier
+                              </Text>
+                            </div>
 
-                    {/* 单张控制按钮 */}
-                    {result.status === 'loading' && (
-                      <div style={{
-                        position: 'absolute',
-                        top: 8,
-                        right: 8,
-                        zIndex: 3
-                      }}>
-                        <Button
-                          type="text"
-                          size="small"
-                          danger
-                          icon={<PauseCircleFilled />}
-                          onClick={() => handleStopSingle(result.id)}
-                          style={{ background: 'rgba(255,255,255,0.8)', borderRadius: '50%', width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                        />
-                      </div>
-                    )}
+                            <div style={{ display: 'flex', gap: 8, zIndex: 11, alignItems: 'center' }}>
+                              {result.status === 'error' && result.autoRetry && (
+                                <div style={{
+                                  color: '#FF5252',
+                                  fontSize: 14,
+                                  cursor: 'pointer',
+                                  transition: 'all 0.2s',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center'
+                                }}
+                                className="hover-scale"
+                                onClick={() => handleStopSingle(result.id)}
+                                >
+                                  <PauseCircleFilled />
+                                </div>
+                              )}
+                              <div style={{
+                                color: '#998888',
+                                fontSize: 14,
+                                cursor: 'pointer',
+                                transition: 'all 0.2s',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center'
+                              }}
+                              className="hover-scale"
+                              onClick={(e) => {
+                                // Add drop animation class before retrying
+                                const paperEl = e.currentTarget.closest('.polaroid-paper');
+                                if (paperEl) {
+                                  paperEl.classList.add('polaroid-dropping');
+                                  setTimeout(() => handleRetrySingle(result.id), 300);
+                                } else {
+                                  handleRetrySingle(result.id);
+                                }
+                              }}
+                              >
+                                {result.status === 'error' && result.error === '已暂停重试' ? 
+                                  <PlayCircleFilled /> : <ReloadOutlined />
+                                }
+                              </div>
+                              
+                              {result.status === 'success' && imageSrc && (
+                                <div style={{
+                                  color: '#998888',
+                                  fontSize: 14,
+                                  cursor: 'pointer',
+                                  transition: 'all 0.2s',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center'
+                                }}
+                                className="hover-scale"
+                                >
+                                  <a
+                                    href={imageSrc}
+                                    download={`image-${result.id}.png`}
+                                    onClick={() => {
+                                      void saveImageToProject(result);
+                                    }}
+                                    style={{ color: 'inherit', display: 'flex' }}
+                                  >
+                                    <DownloadOutlined />
+                                  </a>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
                 );
               })}
             </div>

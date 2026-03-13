@@ -2,3 +2,4 @@ node_modules/
 saved-images/
 server-data/
 .env
+.claude/

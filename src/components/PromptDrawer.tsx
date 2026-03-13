@@ -226,18 +226,12 @@ const PromptCard: React.FC<PromptCardProps> = ({
   return (
     <div 
       style={{ 
-        background: '#fff', 
-        borderRadius: 16,
-        overflow: 'hidden',
-        boxShadow: '0 4px 12px rgba(255, 143, 171, 0.1)',
         cursor: 'pointer',
-        border: `1px solid ${COLORS.accent}`,
         position: 'relative',
         display: 'flex',
         flexDirection: 'column',
-        transition: 'transform 0.2s',
       }}
-      className="prompt-card-hover"
+      className="moe-card"
       onClick={() => onClick(prompt)}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
@@ -420,7 +414,7 @@ const PromptCard: React.FC<PromptCardProps> = ({
 
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 4 }}>
           {prompt.tags?.slice(0, 3).map(tag => (
-            <Tag key={tag} style={{ margin: 0, fontSize: 12, padding: '2px 8px', border: 'none', background: '#F5F5F5', color: COLORS.textLight }}>#{tag}</Tag>
+            <span key={tag} className="moe-tag" style={{ fontSize: 11, padding: '2px 8px', boxShadow: 'none' }}>#{tag}</span>
           ))}
         </div>
         
@@ -989,14 +983,46 @@ const PromptDrawer: React.FC<PromptDrawerProps> = ({ visible, onClose, onCreateT
   }, [allPrompts, selectedContributor]);
 
   const contributorSections = useMemo(() => {
-    const sections = new Set<string>();
-    const sectionMap = new Map<string, string>();
-    contributorPrompts.forEach(p => {
-      sections.add(p.sectionId);
-      sectionMap.set(p.sectionId, p.sectionTitle);
+    const sectionCountMap = new Map<string, number>();
+    const fallbackTitleMap = new Map<string, string>();
+
+    contributorPrompts.forEach((p) => {
+      sectionCountMap.set(p.sectionId, (sectionCountMap.get(p.sectionId) ?? 0) + 1);
+      if (!fallbackTitleMap.has(p.sectionId)) {
+        fallbackTitleMap.set(p.sectionId, p.sectionTitle);
+      }
     });
-    return Array.from(sections).map(id => ({ id, title: sectionMap.get(id)! }));
-  }, [contributorPrompts]);
+
+    if (!data?.sections?.length) {
+      return Array.from(sectionCountMap.entries())
+        .filter(([, count]) => count > 0)
+        .map(([id, count]) => ({
+          id,
+          title: fallbackTitleMap.get(id) ?? id,
+          count
+        }));
+    }
+
+    const orderedSections = data.sections
+      .map((section) => ({
+        id: section.id,
+        title: section.title,
+        count: sectionCountMap.get(section.id) ?? 0
+      }))
+      .filter((section) => section.count > 0);
+
+    const knownIds = new Set(orderedSections.map((section) => section.id));
+    sectionCountMap.forEach((count, id) => {
+      if (count <= 0 || knownIds.has(id)) return;
+      orderedSections.push({
+        id,
+        title: fallbackTitleMap.get(id) ?? id,
+        count
+      });
+    });
+
+    return orderedSections;
+  }, [contributorPrompts, data]);
 
   const contributorTags = useMemo(() => {
     const tags = new Set<string>();
@@ -1121,32 +1147,24 @@ const PromptDrawer: React.FC<PromptDrawerProps> = ({ visible, onClose, onCreateT
       {/* Section Filter */}
       {!isPromptManagerSource && contributorSections.length > 1 && (
         <div>
-          <Title level={5} style={{ color: COLORS.text, marginBottom: 12, fontSize: 14, paddingLeft: 8 }}>
-            <AppstoreFilled style={{ marginRight: 8 }} /> 分类筛选
-          </Title>
+          {!isMobile && <Title level={5} style={{ color: COLORS.text, marginBottom: 12, fontSize: 14, paddingLeft: 8 }}>
+            <AppstoreFilled style={{ marginRight: 8 }} /> 分类
+          </Title>}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             <Button
-              type={contributorActiveSection === 'all' ? 'primary' : 'text'}
-              block
+              className={`moe-nav-btn ${contributorActiveSection === 'all' ? 'active' : ''}`}
               onClick={() => {
                 setContributorActiveSection('all');
                 if (isMobile) setContributorMobileFilterVisible(false);
-              }}
-              style={{ 
-                textAlign: 'left', 
-                justifyContent: 'space-between',
-                height: 40,
-                borderRadius: 12,
-                background: contributorActiveSection === 'all' ? COLORS.primary : 'transparent',
-                color: contributorActiveSection === 'all' ? '#fff' : COLORS.text,
-                fontWeight: contributorActiveSection === 'all' ? 700 : 400
               }}
             >
               <div style={{ display: 'flex', alignItems: 'center' }}>
                 <CompassFilled style={{ color: contributorActiveSection === 'all' ? '#fff' : '#FF9EB5' }} />
                 <span style={{ marginLeft: 8 }}>全部</span>
               </div>
-              <Badge count={contributorPrompts.length} overflowCount={99999} style={{ backgroundColor: COLORS.gold }} />
+              <div style={{ marginLeft: 'auto' }}>
+                <Badge count={contributorPrompts.length} overflowCount={99999} style={{ backgroundColor: COLORS.gold }} />
+              </div>
             </Button>
 
             <div style={{ height: 1, background: COLORS.secondary, margin: '8px 0', opacity: 0.5 }}></div>
@@ -1154,22 +1172,23 @@ const PromptDrawer: React.FC<PromptDrawerProps> = ({ visible, onClose, onCreateT
             {contributorSections.map(section => (
               <Button
                 key={section.id}
-                type={contributorActiveSection === section.id ? 'primary' : 'text'}
-                block
+                className={`moe-nav-btn-secondary ${contributorActiveSection === section.id ? 'active' : ''}`}
                 onClick={() => {
                   setContributorActiveSection(section.id);
                   if (isMobile) setContributorMobileFilterVisible(false);
                 }}
-                style={{ 
-                  textAlign: 'left', 
-                  justifyContent: 'flex-start',
-                  borderRadius: 12,
-                  background: contributorActiveSection === section.id ? COLORS.secondary : 'transparent',
-                  color: contributorActiveSection === section.id ? COLORS.text : COLORS.textLight,
-                  fontWeight: contributorActiveSection === section.id ? 700 : 400
-                }}
               >
-                {section.title}
+                <span>{section.title}</span>
+                <div style={{ marginLeft: 'auto' }}>
+                  <Badge
+                    count={section.count}
+                    overflowCount={99999}
+                    style={{
+                      backgroundColor: contributorActiveSection === section.id ? COLORS.primary : '#F0F0F0',
+                      color: contributorActiveSection === section.id ? '#fff' : COLORS.textLight
+                    }}
+                  />
+                </div>
               </Button>
             ))}
           </div>
@@ -1179,9 +1198,9 @@ const PromptDrawer: React.FC<PromptDrawerProps> = ({ visible, onClose, onCreateT
       {/* Tags Filter */}
       {contributorTags.length > 0 && (
         <div>
-          <Title level={5} style={{ color: COLORS.text, marginBottom: 12, fontSize: 14, paddingLeft: 8 }}>
-            <FilterFilled style={{ marginRight: 8 }} /> 标签筛选
-          </Title>
+          {!isMobile && <Title level={5} style={{ color: COLORS.text, marginBottom: 12, fontSize: 14, paddingLeft: 8 }}>
+            <FilterFilled style={{ marginRight: 8 }} /> 标签
+          </Title>}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(78px, 1fr))', gap: 8 }}>
             {contributorTags.map(tag => (
               <Tag.CheckableTag
@@ -1266,17 +1285,7 @@ const PromptDrawer: React.FC<PromptDrawerProps> = ({ visible, onClose, onCreateT
             return (
               <Button 
                 key={item.id}
-                type={isActive ? 'primary' : 'text'} 
-                block 
-                style={{ 
-                  textAlign: 'left', 
-                  justifyContent: 'space-between',
-                  height: 40,
-                  borderRadius: 12,
-                  background: isActive ? COLORS.primary : 'transparent',
-                  color: isActive ? '#fff' : COLORS.text,
-                  fontWeight: isActive ? 700 : 400
-                }}
+                className={`moe-nav-btn ${isActive ? 'active' : ''}`}
                 onClick={() => {
                   setActiveTab(item.id);
                   if (isMobile) setMobileFilterVisible(false);
@@ -1286,7 +1295,7 @@ const PromptDrawer: React.FC<PromptDrawerProps> = ({ visible, onClose, onCreateT
                   <IconComponent style={{ color: isActive ? '#fff' : item.color }} />
                   <span style={{ marginLeft: 8 }}>{item.label}</span>
                 </div>
-                {item.badge !== undefined ? <Badge count={item.badge} overflowCount={99999} style={{ backgroundColor: badgeColor }} /> : null}
+                {item.badge !== undefined ? <div style={{ marginLeft: 'auto' }}><Badge count={item.badge} overflowCount={99999} style={{ backgroundColor: badgeColor }} /></div> : null}
               </Button>
             );
           })}
@@ -1297,30 +1306,23 @@ const PromptDrawer: React.FC<PromptDrawerProps> = ({ visible, onClose, onCreateT
               {data.sections.map(section => (
                 <Button 
                   key={section.id}
-                  type={activeTab === section.id ? 'primary' : 'text'}
-                  block
-                  style={{ 
-                    textAlign: 'left', 
-                    justifyContent: 'space-between',
-                    borderRadius: 12,
-                    background: activeTab === section.id ? COLORS.secondary : 'transparent',
-                    color: activeTab === section.id ? COLORS.text : COLORS.textLight,
-                    fontWeight: activeTab === section.id ? 700 : 400
-                  }}
+                  className={`moe-nav-btn-secondary ${activeTab === section.id ? 'active' : ''}`}
                   onClick={() => {
                     setActiveTab(section.id);
                     if (isMobile) setMobileFilterVisible(false);
                   }}
                 >
                   <span>{section.title}</span>
-                  <Badge 
-                    count={section.prompts.length} 
-                    overflowCount={99999} 
-                    style={{ 
-                      backgroundColor: activeTab === section.id ? COLORS.primary : '#F0F0F0',
-                      color: activeTab === section.id ? '#fff' : COLORS.textLight
-                    }} 
-                  />
+                  <div style={{ marginLeft: 'auto' }}>
+                    <Badge 
+                      count={section.prompts.length} 
+                      overflowCount={99999} 
+                      style={{ 
+                        backgroundColor: activeTab === section.id ? COLORS.primary : '#F0F0F0',
+                        color: activeTab === section.id ? '#fff' : COLORS.textLight
+                      }} 
+                    />
+                  </div>
                 </Button>
               ))}
             </>

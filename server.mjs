@@ -25,9 +25,11 @@ import {
 } from './server/logger.mjs'
 import { addSseClient, removeSseClient, sendSseEvent } from './server/sse.mjs'
 import {
+  buildBackendStateSnapshot,
   createDefaultTaskState,
   loadBackendCollection,
   loadBackendState,
+  loadBackendStateSnapshot,
   loadTaskState,
   normalizeCollectionPayloadForSave,
   normalizeConcurrency,
@@ -557,20 +559,108 @@ const readGeminiStream = async (response) => {
   return lastJson
 }
 
-const readResponseError = async (response) => {
-  const fallback = response.statusText || `HTTP ${response.status}`
+const normalizeErrorText = (value) =>
+  typeof value === 'string' ? value.trim() : ''
+
+const trySerializeErrorValue = (value) => {
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return ''
+  }
+}
+
+const normalizeErrorCompare = (value) =>
+  normalizeErrorText(value).replace(/\s+/g, ' ').toLowerCase()
+
+const extractErrorDetail = (value) => {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed || ''
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value)
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = extractErrorDetail(item)
+      if (nested) return nested
+    }
+    return trySerializeErrorValue(value)
+  }
+  if (!value || typeof value !== 'object') {
+    return ''
+  }
+
+  const record = value
+  const candidates = [
+    record.detail,
+    record.message,
+    record.error_description,
+    record.error,
+    record.reason,
+  ]
+
+  for (const candidate of candidates) {
+    const nested = extractErrorDetail(candidate)
+    if (nested) return nested
+  }
+
+  return trySerializeErrorValue(value)
+}
+
+const formatHttpErrorMessage = ({ status, statusText, body, fallback }) => {
+  const detail = extractErrorDetail(body)
+  const headline = normalizeErrorText(statusText)
+  const sameMessage =
+    detail && headline && normalizeErrorCompare(detail) === normalizeErrorCompare(headline)
+  const suffix = detail && !sameMessage ? detail : ''
+  const prefix = typeof status === 'number' ? `[${status}]` : ''
+
+  if (prefix && headline && suffix) {
+    return `${prefix} ${headline}: ${suffix}`
+  }
+  if (prefix && headline) {
+    return `${prefix} ${headline}`
+  }
+  if (prefix && suffix) {
+    return `${prefix} ${suffix}`
+  }
+  if (headline && suffix) {
+    return `${headline}: ${suffix}`
+  }
+  if (headline) {
+    return headline
+  }
+  if (suffix) {
+    return suffix
+  }
+  return fallback
+}
+
+const readResponseBodySafely = async (response) => {
   try {
     const text = await response.text()
-    if (!text) return fallback
+    if (!text) return undefined
     try {
-      const data = JSON.parse(text)
-      return data?.error?.message || data?.message || text
+      return JSON.parse(text)
     } catch {
       return text
     }
   } catch {
-    return fallback
+    return undefined
   }
+}
+
+const readResponseError = async (response) => {
+  const fallback = response.statusText || `HTTP ${response.status}`
+  const body = await readResponseBodySafely(response)
+  return formatHttpErrorMessage({
+    status: response.status,
+    statusText: response.statusText,
+    body,
+    fallback,
+  })
 }
 
 const requestImageUrl = async (config, messages, signal) => {
@@ -604,6 +694,11 @@ const requestImageUrl = async (config, messages, signal) => {
         body: JSON.stringify({ contents }),
         signal,
       })
+      if (!response.ok) {
+        const message = await readResponseError(response)
+        logBackendResponse('json-error', { status: response.status, message })
+        throw new Error(message)
+      }
       data = config.stream ? await readGeminiStream(response) : await response.json()
     } catch (err) {
       logBackendOutbound('api-request-error', {
@@ -614,15 +709,6 @@ const requestImageUrl = async (config, messages, signal) => {
     }
 
     logBackendOutbound('api-response', { ...requestInfo, status: response.status })
-    if (!response.ok) {
-      const message =
-        data?.error?.message ||
-        (typeof data === 'string' ? data : '') ||
-        response.statusText
-      logBackendResponse('json-error', { status: response.status, message })
-      throw new Error(message)
-    }
-
     const imageUrl = resolveImageFromResponse(data)
     if (!imageUrl) {
       logBackendResponse('json-response', data)
@@ -775,16 +861,22 @@ const downloadImageBuffer = async (imageUrl) => {
     throw err
   }
   if (!response.ok) {
+    const message = await readResponseError(response)
     logBackendOutbound('image-download-response', {
       url: imageUrl,
       status: response.status,
+      message,
     })
-    throw new Error(response.statusText)
+    throw new Error(message)
   }
   const arrayBuffer = await response.arrayBuffer()
   const contentType = response.headers.get('content-type') || 'application/octet-stream'
   return { buffer: Buffer.from(arrayBuffer), contentType }
 }
+
+const isAutoRetryPending = (item) => item?.status === 'error' && item?.autoRetry === true
+
+const isTaskResultActive = (item) => item?.status === 'loading' || item?.autoRetry === true
 
 const scheduleRetry = (taskId, subTaskId) => {
   if (retryTimers.has(subTaskId)) return
@@ -796,14 +888,15 @@ const scheduleRetry = (taskId, subTaskId) => {
     if (resultIndex === -1) return
     const current = taskState.results[resultIndex]
     if (current?.autoRetry === false) return
-    if (current.status !== 'loading') return
-    void runSubTask(taskId, subTaskId)
+    if (!isAutoRetryPending(current)) return
+    void runSubTask(taskId, subTaskId, { preserveVisibleState: true })
   }, RETRY_DELAY_MS)
   retryTimers.set(subTaskId, timer)
 }
 
 const runSubTask = async (taskId, subTaskId, options = {}) => {
   const countRequest = options.countRequest !== false
+  const preserveVisibleState = options.preserveVisibleState === true
   if (activeControllers.has(subTaskId)) return
   clearRetryTimer(subTaskId)
   const controller = new AbortController()
@@ -828,9 +921,11 @@ const runSubTask = async (taskId, subTaskId, options = {}) => {
     typeof currentResult?.startTime === 'number' && Number.isFinite(currentResult.startTime)
       ? currentResult.startTime
       : Date.now()
+  const keepVisibleError =
+    preserveVisibleState && currentResult?.status === 'error' && currentResult?.autoRetry === true
   taskState.results[resultIndex] = {
     ...currentResult,
-    status: 'loading',
+    status: keepVisibleError ? 'error' : 'loading',
     error: currentResult?.error,
     startTime,
     endTime: undefined,
@@ -937,7 +1032,7 @@ const runSubTask = async (taskId, subTaskId, options = {}) => {
     if (shouldRetry) {
       freshState.results[freshIndex] = {
         ...current,
-        status: 'loading',
+        status: 'error',
         error: `${errorMessage} (1s后重试...)`,
         retryCount: (current.retryCount || 0) + 1,
         autoRetry: true,
@@ -1043,7 +1138,7 @@ const stopSubTask = async (taskId, subTaskId, mode = 'pause') => {
 
   const nextResults = taskState.results.map((item) => {
     if (subTaskId && item.id !== subTaskId) return item
-    if (item.status !== 'loading') return item
+    if (!isTaskResultActive(item)) return item
     return {
       ...item,
       status: 'error',
@@ -1142,7 +1237,7 @@ app.get('/api/backend/stream', requireBackendAuth, async (req, res) => {
     removeSseClient(res)
   })
   try {
-    const state = await loadBackendState()
+    const state = await loadBackendStateSnapshot()
     sendSseEvent(res, 'state', state)
   } catch (err) {
     console.warn('初始化事件流状态失败:', err)
@@ -1151,7 +1246,7 @@ app.get('/api/backend/stream', requireBackendAuth, async (req, res) => {
 
 app.get('/api/backend/state', requireBackendAuth, async (_req, res) => {
   try {
-    const state = await loadBackendState()
+    const state = await loadBackendStateSnapshot()
     res.json(state)
   } catch (err) {
     console.error('backend state error:', err)
@@ -1188,7 +1283,7 @@ app.patch('/api/backend/state', requireBackendAuth, async (req, res) => {
       next.globalStats = { ...DEFAULT_GLOBAL_STATS, ...req.body.globalStats }
     }
     await saveBackendState(next)
-    res.json(next)
+    res.json(buildBackendStateSnapshot(next))
   } catch (err) {
     console.error('backend state write error:', err)
     res.status(500).json({ error: 'Write Error' })
@@ -1326,8 +1421,8 @@ app.delete('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
 
 app.post('/api/backend/task/:id/generate', requireBackendAuth, async (req, res) => {
   try {
-    const state = await startGeneration(req.params.id)
-    res.json(state)
+    await startGeneration(req.params.id)
+    res.status(204).end()
   } catch (err) {
     console.error('backend generate error:', err)
     res.status(500).json({ error: 'Generate Error' })
@@ -1346,7 +1441,7 @@ app.post('/api/backend/task/:id/retry', requireBackendAuth, async (req, res) => 
       res.status(404).json({ error: 'Not Found' })
       return
     }
-    res.json(state)
+    res.status(204).end()
   } catch (err) {
     console.error('backend retry error:', err)
     res.status(500).json({ error: 'Retry Error' })
@@ -1361,7 +1456,7 @@ app.post('/api/backend/task/:id/stop', requireBackendAuth, async (req, res) => {
       res.status(404).json({ error: 'Not Found' })
       return
     }
-    res.json(state)
+    res.status(204).end()
   } catch (err) {
     console.error('backend stop error:', err)
     res.status(500).json({ error: 'Stop Error' })

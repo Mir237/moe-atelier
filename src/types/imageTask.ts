@@ -6,6 +6,7 @@ export interface SubTaskResult {
   localKey?: string;
   sourceUrl?: string;
   savedLocal?: boolean;
+  autoRetry?: boolean;
   status: 'pending' | 'loading' | 'success' | 'error';
   error?: string;
   retryCount: number;
@@ -18,6 +19,7 @@ export interface PersistedSubTaskResult {
   id: string;
   status: SubTaskResult['status'];
   error?: string;
+  autoRetry?: boolean;
   retryCount: number;
   startTime?: number;
   endTime?: number;
@@ -43,7 +45,10 @@ export interface PersistedImageTaskState {
   prompt: string;
   concurrency: number;
   enableSound: boolean;
+  retryInterval?: number;
+  retryLimit?: number;
   results: PersistedSubTaskResult[];
   uploads?: PersistedUploadImage[];
   stats: TaskStats;
+  apiProfileId?: string;
 }
