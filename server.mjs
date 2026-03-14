@@ -272,6 +272,22 @@ const updateGlobalStats = async (type, duration, count) => {
   await saveBackendState({ ...state, globalStats: stats })
 }
 
+const resolveTaskApiConfig = (taskState, backendState) => {
+  const baseConfig = backendState?.config || {}
+  const profiles = Array.isArray(baseConfig.apiProfiles) ? baseConfig.apiProfiles : []
+  const taskProfileId = typeof taskState?.apiProfileId === 'string' ? taskState.apiProfileId : ''
+  const matchedProfile = taskProfileId
+    ? profiles.find((profile) => profile?.id === taskProfileId)
+    : null
+  if (!matchedProfile) {
+    return baseConfig
+  }
+  return {
+    ...baseConfig,
+    ...matchedProfile,
+  }
+}
+
 const buildMessagesForTask = async (taskState) => {
   const content = []
   if (taskState.prompt) {
@@ -976,9 +992,10 @@ const runSubTask = async (taskId, subTaskId, options = {}) => {
 
   try {
     const backendState = await loadBackendState()
+    const taskApiConfig = resolveTaskApiConfig(taskState, backendState)
     const shouldCollect = Boolean(backendState?.config?.enableCollection)
     const messages = await buildMessagesForTask(taskState)
-    const imageUrl = await requestImageUrl(backendState.config, messages, controller.signal)
+    const imageUrl = await requestImageUrl(taskApiConfig, messages, controller.signal)
     if (!imageUrl) {
       throw new Error('未在响应中找到图片数据')
     }
@@ -1416,6 +1433,7 @@ app.patch('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
       enableSound: typeof payload.enableSound === 'boolean' ? payload.enableSound : current.enableSound,
       retryInterval: normalizeRetryInterval(payload?.retryInterval, current.retryInterval),
       retryLimit: normalizeRetryLimit(payload?.retryLimit, current.retryLimit),
+      apiProfileId: typeof payload.apiProfileId === 'string' ? payload.apiProfileId : current.apiProfileId,
       uploads: Array.isArray(payload?.uploads) ? payload.uploads : current.uploads,
     }
     await saveTaskState(req.params.id, next)

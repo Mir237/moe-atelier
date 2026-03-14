@@ -194,6 +194,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const retryIntervalRef = useRef(retryInterval);
   const retryLimitRef = useRef(retryLimit);
   const [apiProfileId, setApiProfileId] = useState<string>('default');
+  const apiProfileIdRef = useRef(apiProfileId);
   
   const [results, setResults] = useState<SubTaskResult[]>([]);
   const [isGlobalLoading, setIsGlobalLoading] = useState(false);
@@ -227,6 +228,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const promptGuard = useInputGuard({ isEditing: () => promptFocusedRef.current });
   const retryIntervalGuard = useInputGuard();
   const retryLimitGuard = useInputGuard();
+  const apiProfileGuard = useInputGuard();
   const backendPayload = React.useMemo(() => {
     if (!backendMode || !hydrated) return null;
     return {
@@ -264,7 +266,19 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     clearDirty: clearRetryLimitDirty,
     shouldPreserve: shouldPreserveRetryLimitInput,
   } = retryLimitGuard;
+  const {
+    markDirty: markApiProfileDirty,
+    clearDirty: clearApiProfileDirty,
+    shouldPreserve: shouldPreserveApiProfileInput,
+  } = apiProfileGuard;
   const { markSynced: markTaskSynced } = taskSync;
+
+  const resolveTaskApiProfileId = (value?: string) => {
+    const availableProfiles = config.apiProfiles || [{ id: 'default', name: '默认配置' }];
+    const fallbackProfileId = config.activeApiProfileId || availableProfiles[0]?.id || 'default';
+    if (!value) return fallbackProfileId;
+    return availableProfiles.some((profile) => profile.id === value) ? value : fallbackProfileId;
+  };
 
   const withBackendToken = (url: string) => {
     const cleaned = stripBackendToken(url);
@@ -367,6 +381,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     const currentPrompt = promptRef.current;
     const currentRetryInterval = retryIntervalRef.current;
     const currentRetryLimit = retryLimitRef.current;
+    const currentApiProfileId = apiProfileIdRef.current;
     const shouldPreservePrompt =
       options.preservePrompt ||
       shouldPreservePromptInput(nextPrompt, currentPrompt);
@@ -378,8 +393,10 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       shouldPreserveRetryIntervalInput(nextRetryInterval, currentRetryInterval);
     const shouldPreserveRetryLimit =
       shouldPreserveRetryLimitInput(nextRetryLimit, currentRetryLimit);
-    const nextApiProfileId = stored.apiProfileId || config.activeApiProfileId || 'default';
+    const nextApiProfileId = resolveTaskApiProfileId(stored.apiProfileId);
     const storedUploads = Array.isArray(stored.uploads) ? stored.uploads : [];
+    const shouldPreserveApiProfile =
+      shouldPreserveApiProfileInput(nextApiProfileId, currentApiProfileId);
     markTaskSynced({
       prompt: nextPrompt,
       concurrency: nextConcurrency,
@@ -390,7 +407,13 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       uploads: normalizeUploadsPayload(storedUploads),
     });
 
-    setApiProfileId(nextApiProfileId);
+    if (!shouldPreserveApiProfile) {
+      apiProfileIdRef.current = nextApiProfileId;
+      clearApiProfileDirty();
+      setApiProfileId(nextApiProfileId);
+    } else if (nextApiProfileId === currentApiProfileId) {
+      clearApiProfileDirty();
+    }
 
     if (!shouldPreservePrompt) {
       promptRef.current = nextPrompt;
@@ -506,7 +529,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         setEnableSound(typeof stored.enableSound === 'boolean' ? stored.enableSound : true);
         setRetryInterval(typeof stored.retryInterval === 'number' ? stored.retryInterval : 1000);
         setRetryLimit(typeof stored.retryLimit === 'number' ? stored.retryLimit : -1);
-        setApiProfileId(stored.apiProfileId || config.activeApiProfileId || 'default');
+        setApiProfileId(resolveTaskApiProfileId(stored.apiProfileId));
         setStats({ ...DEFAULT_TASK_STATS, ...(stored.stats || {}) });
         const storedResults = Array.isArray(stored.results) ? stored.results : [];
         const hydratedResults: SubTaskResult[] = [];
@@ -594,6 +617,10 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   useEffect(() => {
     retryLimitRef.current = retryLimit;
   }, [retryLimit]);
+
+  useEffect(() => {
+    apiProfileIdRef.current = apiProfileId;
+  }, [apiProfileId]);
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
@@ -803,6 +830,13 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     markRetryLimitDirty();
     retryLimitRef.current = nextRetryLimit;
     setRetryLimit(nextRetryLimit);
+  };
+
+  const handleApiProfileChange = (value: string) => {
+    const nextApiProfileId = resolveTaskApiProfileId(value);
+    markApiProfileDirty();
+    apiProfileIdRef.current = nextApiProfileId;
+    setApiProfileId(nextApiProfileId);
   };
 
   function syncStickyNoteScroll() {
@@ -2241,7 +2275,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
             <Select
               size="small"
               value={apiProfileId}
-              onChange={(val: string) => setApiProfileId(val)}
+              onChange={handleApiProfileChange}
               options={(config.apiProfiles || [{ id: 'default', name: '默认配置' }]).map(p => ({ label: p.name, value: p.id }))}
               style={{ minWidth: 80 }}
               variant="borderless"
