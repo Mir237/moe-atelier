@@ -5,6 +5,7 @@ import {
   backendCollectionPath,
   backendStatePath,
   backendTasksDir,
+  coerceApiFormat,
   DEFAULT_BACKEND_CONFIG,
   DEFAULT_CONCURRENCY,
   DEFAULT_GLOBAL_STATS,
@@ -187,10 +188,7 @@ const normalizeBackendState = (data) => {
     rawFormatMap && typeof rawFormatMap === 'object' && !Array.isArray(rawFormatMap)
       ? { ...rawFormatMap }
       : {}
-  const apiFormat =
-    config.apiFormat === 'gemini' || config.apiFormat === 'vertex'
-      ? config.apiFormat
-      : 'openai'
+  const apiFormat = coerceApiFormat(config.apiFormat)
   config.apiFormat = apiFormat
   if (!configByFormat[apiFormat]) {
     configByFormat[apiFormat] = pickFormatConfig(config)
@@ -231,6 +229,7 @@ export const loadBackendCollection = async () => {
 
 export const saveBackendCollection = async (items) => {
   await writeJsonFileAtomic(backendCollectionPath, items)
+  broadcastSseEvent('collection', items)
 }
 
 const getTaskFilePath = (taskId) => path.join(backendTasksDir, `${taskId}.json`)

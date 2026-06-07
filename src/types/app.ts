@@ -5,13 +5,16 @@ export interface ImageConfig {
   aspectRatio: string;
 }
 
+export type OpenAiEndpointMode = 'chat' | 'images';
+
 export interface ApiProfile {
   id: string;
   name: string;
   apiUrl: string;
   apiKey: string;
   model: string;
-  apiFormat: 'openai' | 'gemini' | 'vertex';
+  apiFormat: 'openai' | 'gemini' | 'vertex' | 'vertex-express' | 'novelai';
+  openaiEndpointMode: OpenAiEndpointMode;
   apiVersion: string;
   vertexProjectId?: string;
   vertexLocation?: string;
@@ -31,7 +34,8 @@ export interface AppConfig {
   apiUrl: string;
   apiKey: string;
   model: string;
-  apiFormat: 'openai' | 'gemini' | 'vertex';
+  apiFormat: 'openai' | 'gemini' | 'vertex' | 'vertex-express' | 'novelai';
+  openaiEndpointMode: OpenAiEndpointMode;
   apiVersion: string;
   vertexProjectId?: string;
   vertexLocation?: string;

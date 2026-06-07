@@ -177,15 +177,27 @@ export const cleanupBackendImages = async (keys: string[]) =>
     body: { keys },
   });
 
-export const generateBackendTask = async (taskId: string) =>
+type BackendGenerationOptions = {
+  runtimeConfig?: AppConfig;
+};
+
+export const generateBackendTask = async (
+  taskId: string,
+  options: BackendGenerationOptions = {},
+) =>
   backendOk(`/api/backend/task/${encodeURIComponent(taskId)}/generate`, {
     method: 'POST',
+    body: options,
   });
 
-export const retryBackendSubTask = async (taskId: string, subTaskId: string) =>
+export const retryBackendSubTask = async (
+  taskId: string,
+  subTaskId: string,
+  options: BackendGenerationOptions = {},
+) =>
   backendOk(`/api/backend/task/${encodeURIComponent(taskId)}/retry`, {
     method: 'POST',
-    body: { subTaskId },
+    body: { subTaskId, ...options },
   });
 
 export type BackendStopMode = 'pause' | 'abort';

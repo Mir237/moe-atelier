@@ -53,6 +53,7 @@ export const DEFAULT_BACKEND_CONFIG = {
   apiKey: '',
   model: '',
   apiFormat: 'openai',
+  openaiEndpointMode: 'chat',
   apiVersion: 'v1',
   vertexProjectId: '',
   vertexLocation: 'us-central1',
@@ -61,11 +62,17 @@ export const DEFAULT_BACKEND_CONFIG = {
   enableCollection: false,
 }
 
+export const API_FORMATS = ['openai', 'gemini', 'vertex', 'vertex-express', 'novelai']
+
+export const coerceApiFormat = (value) =>
+  API_FORMATS.includes(value) ? value : 'openai'
+
 export const FORMAT_CONFIG_KEYS = [
   'apiUrl',
   'apiKey',
   'model',
   'apiVersion',
+  'openaiEndpointMode',
   'vertexProjectId',
   'vertexLocation',
   'vertexPublisher',

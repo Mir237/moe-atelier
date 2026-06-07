@@ -75,7 +75,11 @@ export const useDebouncedSync = <T>({
           schedule(retryDelay);
           return;
         }
-        void onSync(payload);
+        void Promise.resolve(onSync(payload)).catch((err) => {
+          console.warn('同步失败，将重试:', err);
+          lastKeyRef.current = '';
+          schedule(retryDelay);
+        });
       }, delayMs);
     };
 

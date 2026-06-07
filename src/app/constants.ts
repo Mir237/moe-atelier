@@ -1,4 +1,4 @@
-export const IMAGE_SIZE_OPTIONS = ['1K', '2K', '4K'];
+export const IMAGE_SIZE_OPTIONS = ['512', '1K', '2K', '4K'];
 export const ASPECT_RATIO_OPTIONS = [
   'auto',
   '1:1',
@@ -10,6 +10,11 @@ export const ASPECT_RATIO_OPTIONS = [
   '3:2',
   '4:5',
   '5:4',
+  '21:9',
+  '1:4',
+  '4:1',
+  '1:8',
+  '8:1',
 ];
 
 export const SAFETY_OPTIONS = [

@@ -56,11 +56,14 @@ interface ConfigDrawerProps {
   backendMode: boolean;
   backendAuthPending: boolean;
   backendPassword: string;
+  apiConfigDirty: boolean;
   onBackendPasswordChange: (value: string) => void;
   onBackendEnable: () => void;
   onBackendDisable: () => void;
   onBackendAuthCancel: () => void;
   onBackendAuthConfirm: () => void;
+  onSaveApiProfile: () => void;
+  onApiProfileChange: (value: string) => void;
 }
 
 const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
@@ -78,11 +81,14 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
   backendMode,
   backendAuthPending,
   backendPassword,
+  apiConfigDirty,
   onBackendPasswordChange,
   onBackendEnable,
   onBackendDisable,
   onBackendAuthCancel,
   onBackendAuthConfirm,
+  onSaveApiProfile,
+  onApiProfileChange,
 }) => {
   const [editingProfileId, setEditingProfileId] = React.useState<string | null>(null);
   const [editingProfileName, setEditingProfileName] = React.useState<string>('');
@@ -125,8 +131,16 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
   };
 
   const handleProfileChange = (value: string) => {
-    onConfigChange({ activeApiProfileId: value }, { ...config, activeApiProfileId: value });
+    onApiProfileChange(value);
   };
+
+  const apiFormatOptions: Array<{ label: string; value: ApiFormat }> = [
+    { label: 'OpenAI', value: 'openai' },
+    { label: 'Gemini', value: 'gemini' },
+    { label: 'Vertex AI', value: 'vertex' },
+    { label: 'Vertex AI Express', value: 'vertex-express' },
+    { label: 'NovelAI', value: 'novelai' },
+  ];
 
   return (
   <Drawer
@@ -181,6 +195,13 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
             <Tooltip title="重命名当前配置">
               <Button icon={<EditOutlined />} onClick={handleStartRename} />
             </Tooltip>
+            <Tooltip title={apiConfigDirty ? '保存当前配置档' : '当前配置档已保存'}>
+              <Button
+                icon={<SaveOutlined />}
+                type={apiConfigDirty ? 'primary' : 'default'}
+                onClick={onSaveApiProfile}
+              />
+            </Tooltip>
             <Tooltip title="添加新配置">
               <Button icon={<PlusOutlined />} onClick={handleAddProfile} />
             </Tooltip>
@@ -197,18 +218,33 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
 
       <Form.Item label={<span style={{ fontWeight: 700, color: '#665555' }}>API 格式</span>}>
         <Form.Item name="apiFormat" noStyle>
-          <Radio.Group optionType="button" buttonStyle="solid">
-            <Radio.Button value="openai">OpenAI</Radio.Button>
-            <Radio.Button value="gemini">Gemini</Radio.Button>
-            <Radio.Button value="vertex">Vertex</Radio.Button>
-          </Radio.Group>
+          <Select size="large" options={apiFormatOptions} />
         </Form.Item>
       </Form.Item>
 
       <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat}>
         {({ getFieldValue }) => {
           const apiFormat = getFieldValue('apiFormat') || 'openai';
-          if (apiFormat === 'openai') {
+          if (apiFormat !== 'openai') {
+            return null;
+          }
+          return (
+            <Form.Item label={<span style={{ fontWeight: 700, color: '#665555' }}>接口路径</span>}>
+              <Form.Item name="openaiEndpointMode" noStyle>
+                <Radio.Group optionType="button" buttonStyle="solid">
+                  <Radio.Button value="chat">Chat Completions</Radio.Button>
+                  <Radio.Button value="images">Images API</Radio.Button>
+                </Radio.Group>
+              </Form.Item>
+            </Form.Item>
+          );
+        }}
+      </Form.Item>
+
+      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat}>
+        {({ getFieldValue }) => {
+          const apiFormat = getFieldValue('apiFormat') || 'openai';
+          if (apiFormat === 'openai' || apiFormat === 'novelai') {
             return null;
           }
           return (
@@ -245,6 +281,32 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
 
       <Form.Item name="apiKey" label={<span style={{ fontWeight: 700, color: '#665555' }}>API 密钥</span>}>
         <Input.Password size="large" placeholder="sk-..." prefix={<SafetyCertificateFilled style={{ color: '#FF9EB5' }} />} />
+      </Form.Item>
+
+      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat}>
+        {({ getFieldValue }) => {
+          const apiFormat = getFieldValue('apiFormat') || 'openai';
+          if (apiFormat !== 'vertex' && apiFormat !== 'vertex-express') {
+            return null;
+          }
+          return (
+            <>
+              {apiFormat === 'vertex' && (
+                <>
+                  <Form.Item name="vertexProjectId" label={<span style={{ fontWeight: 700, color: '#665555' }}>Vertex Project ID</span>}>
+                    <Input size="large" placeholder="my-project-id" />
+                  </Form.Item>
+                  <Form.Item name="vertexLocation" label={<span style={{ fontWeight: 700, color: '#665555' }}>Vertex Location</span>}>
+                    <Input size="large" placeholder="us-central1" />
+                  </Form.Item>
+                </>
+              )}
+              <Form.Item name="vertexPublisher" label={<span style={{ fontWeight: 700, color: '#665555' }}>Vertex Publisher</span>}>
+                <Input size="large" placeholder="google" />
+              </Form.Item>
+            </>
+          );
+        }}
       </Form.Item>
 
       <Form.Item label={<span style={{ fontWeight: 700, color: '#665555' }}>模型名称</span>} style={{ marginBottom: 48 }}>
@@ -320,7 +382,7 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
               items={[
                 {
                   key: '1',
-                  label: <span style={{ fontWeight: 700, color: '#8B5E34' }}>高级设置（Gemini / Vertex）</span>,
+                  label: <span style={{ fontWeight: 700, color: '#8B5E34' }}>高级设置</span>,
                   style: { background: '#FFF7E6', borderRadius: 16, border: '1px dashed #FFD591', marginBottom: 24 },
                   children: (
                     <div>

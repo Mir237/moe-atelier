@@ -5,6 +5,7 @@ import type { GlobalStats } from '../types/stats';
 import { safeStorageGet, safeStorageRemove, safeStorageSet } from '../utils/storage';
 import { openImageDb, IMAGE_STORE_NAME } from '../utils/imageDb';
 import { buildPromptKey } from '../utils/prompt';
+import { coerceApiFormat } from '../utils/providerRequests.mjs';
 
 export const STORAGE_KEYS = {
   config: 'moe-image-config',
@@ -24,6 +25,7 @@ export type FormatConfig = Pick<
   | 'apiKey'
   | 'model'
   | 'apiVersion'
+  | 'openaiEndpointMode'
   | 'vertexProjectId'
   | 'vertexLocation'
   | 'vertexPublisher'
@@ -69,6 +71,7 @@ const DEFAULT_FORMAT_CONFIGS: Record<ApiFormat, FormatConfig> = {
     apiKey: '',
     model: '',
     apiVersion: 'v1',
+    openaiEndpointMode: 'chat',
     vertexProjectId: '',
     vertexLocation: 'global',
     vertexPublisher: 'google',
@@ -79,6 +82,7 @@ const DEFAULT_FORMAT_CONFIGS: Record<ApiFormat, FormatConfig> = {
     apiKey: '',
     model: '',
     apiVersion: 'v1beta',
+    openaiEndpointMode: 'chat',
     vertexProjectId: '',
     vertexLocation: 'global',
     vertexPublisher: 'google',
@@ -89,8 +93,31 @@ const DEFAULT_FORMAT_CONFIGS: Record<ApiFormat, FormatConfig> = {
     apiKey: '',
     model: '',
     apiVersion: 'v1beta1',
+    openaiEndpointMode: 'chat',
     vertexProjectId: '',
     vertexLocation: 'us-central1',
+    vertexPublisher: 'google',
+    ...createDefaultAdvancedConfig(),
+  },
+  'vertex-express': {
+    apiUrl: 'https://aiplatform.googleapis.com',
+    apiKey: '',
+    model: '',
+    apiVersion: 'v1',
+    openaiEndpointMode: 'chat',
+    vertexProjectId: '',
+    vertexLocation: 'global',
+    vertexPublisher: 'google',
+    ...createDefaultAdvancedConfig(),
+  },
+  novelai: {
+    apiUrl: 'https://image.novelai.net',
+    apiKey: '',
+    model: '',
+    apiVersion: '',
+    openaiEndpointMode: 'chat',
+    vertexProjectId: '',
+    vertexLocation: 'global',
     vertexPublisher: 'google',
     ...createDefaultAdvancedConfig(),
   },
@@ -112,6 +139,8 @@ const DEFAULT_GLOBAL_STATS: GlobalStats = {
 };
 
 const coerceConfigString = (value: unknown) => (typeof value === 'string' ? value : '');
+const coerceOpenAiEndpointMode = (value: unknown): AppConfig['openaiEndpointMode'] =>
+  value === 'images' ? 'images' : 'chat';
 const coerceBoolean = (value: unknown, fallback: boolean) =>
   typeof value === 'boolean' ? value : fallback;
 const coerceNumber = (value: unknown, fallback: number) =>
@@ -152,11 +181,19 @@ const coerceImageConfig = (value: unknown) => {
   return { imageSize, aspectRatio };
 };
 
+const normalizeApiProfiles = (profiles: AppConfig['apiProfiles']) =>
+  profiles?.map((profile) => ({
+    ...profile,
+    apiFormat: coerceApiFormat(profile.apiFormat) as ApiFormat,
+    openaiEndpointMode: coerceOpenAiEndpointMode(profile.openaiEndpointMode),
+  }));
+
 export const buildFormatConfig = (value: Partial<AppConfig> = {}): FormatConfig => ({
   apiUrl: coerceConfigString(value.apiUrl),
   apiKey: coerceConfigString(value.apiKey),
   model: coerceConfigString(value.model),
   apiVersion: coerceConfigString(value.apiVersion),
+  openaiEndpointMode: coerceOpenAiEndpointMode(value.openaiEndpointMode),
   vertexProjectId: coerceConfigString(value.vertexProjectId),
   vertexLocation: coerceConfigString(value.vertexLocation),
   vertexPublisher: coerceConfigString(value.vertexPublisher),
@@ -193,6 +230,7 @@ export const loadConfig = (): AppConfig => {
   if (!raw) {
     const formatConfig = loadFormatConfig(DEFAULT_CONFIG.apiFormat);
     const finalConfig = { ...DEFAULT_CONFIG, ...formatConfig };
+    finalConfig.apiProfiles = normalizeApiProfiles(finalConfig.apiProfiles);
     if (!finalConfig.apiProfiles || finalConfig.apiProfiles.length === 0) {
       finalConfig.apiProfiles = [{
         id: 'default',
@@ -201,6 +239,7 @@ export const loadConfig = (): AppConfig => {
         apiKey: finalConfig.apiKey,
         model: finalConfig.model,
         apiFormat: finalConfig.apiFormat,
+        openaiEndpointMode: finalConfig.openaiEndpointMode,
         apiVersion: finalConfig.apiVersion,
         vertexProjectId: finalConfig.vertexProjectId,
         vertexLocation: finalConfig.vertexLocation,
@@ -222,13 +261,14 @@ export const loadConfig = (): AppConfig => {
   try {
     const data = JSON.parse(raw);
     const baseConfig = { ...DEFAULT_CONFIG, ...data };
-    const apiFormat = (baseConfig.apiFormat || DEFAULT_CONFIG.apiFormat) as ApiFormat;
+    const apiFormat = coerceApiFormat(baseConfig.apiFormat) as ApiFormat;
     const storedFormat = formatMap?.[apiFormat];
     const hasLegacyFormatFields = [
       'apiUrl',
       'apiKey',
       'model',
       'apiVersion',
+      'openaiEndpointMode',
       'vertexProjectId',
       'vertexLocation',
       'vertexPublisher',
@@ -252,6 +292,7 @@ export const loadConfig = (): AppConfig => {
       ...fallbackFormat,
     };
     const finalConfig = { ...baseConfig, ...formatConfig, apiFormat };
+    finalConfig.apiProfiles = normalizeApiProfiles(finalConfig.apiProfiles);
     if (!finalConfig.apiProfiles || finalConfig.apiProfiles.length === 0) {
       finalConfig.apiProfiles = [{
         id: 'default',
@@ -260,6 +301,7 @@ export const loadConfig = (): AppConfig => {
         apiKey: finalConfig.apiKey,
         model: finalConfig.model,
         apiFormat: finalConfig.apiFormat,
+        openaiEndpointMode: finalConfig.openaiEndpointMode,
         apiVersion: finalConfig.apiVersion,
         vertexProjectId: finalConfig.vertexProjectId,
         vertexLocation: finalConfig.vertexLocation,

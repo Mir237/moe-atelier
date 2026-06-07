@@ -32,12 +32,17 @@ import { getBase64 } from '../utils/file';
 import { parseMarkdownImage, resolveImageFromResponse } from '../utils/imageResponse';
 import { openImageDb, IMAGE_STORE_NAME } from '../utils/imageDb';
 import {
-  extractVertexProjectId,
-  inferApiVersionFromUrl,
-  normalizeApiBase,
+  buildGeminiPayload,
+  buildGoogleGenerateRequest,
+  buildNovelAiRequest,
+  buildOpenAiBaseUrl,
+  buildOpenAiChatUrl,
+  buildOpenAiImagesUrl,
+  coerceApiFormat,
+  extractFirstImageFromNovelAiZip,
+  isGoogleApiFormat,
   resolveApiUrl,
-  resolveApiVersion,
-} from '../utils/apiUrl';
+} from '../utils/providerRequests.mjs';
 import { calculateSuccessRate, formatDuration } from '../utils/stats';
 import { buildPromptKey } from '../utils/prompt';
 import {
@@ -95,6 +100,42 @@ type CollectionUploadSnapshot = {
 type CollectionRequestSnapshot = {
   prompt: string;
   uploads: CollectionUploadSnapshot[];
+};
+
+type BackendTaskSyncPayload = {
+  prompt: string;
+  concurrency: number;
+  enableSound: boolean;
+  retryInterval: number;
+  retryLimit: number;
+  apiProfileId: string;
+  uploads: PersistedUploadImage[];
+};
+
+const areSyncValuesEqual = (previous: unknown, next: unknown) =>
+  JSON.stringify(previous) === JSON.stringify(next);
+
+const buildBackendTaskPatch = (
+  previous: BackendTaskSyncPayload | null,
+  next: BackendTaskSyncPayload,
+): Partial<PersistedImageTaskState> => {
+  if (!previous) return next;
+  const patch: Partial<PersistedImageTaskState> = {};
+  const keys: Array<keyof BackendTaskSyncPayload> = [
+    'prompt',
+    'concurrency',
+    'enableSound',
+    'retryInterval',
+    'retryLimit',
+    'apiProfileId',
+    'uploads',
+  ];
+  keys.forEach((key) => {
+    if (!areSyncValuesEqual(previous[key], next[key])) {
+      (patch as Record<string, unknown>)[key] = next[key];
+    }
+  });
+  return patch;
 };
 
 const normalizeStoredResult = (item: PersistedSubTaskResult, backendMode: boolean): SubTaskResult => {
@@ -200,6 +241,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const [isGlobalLoading, setIsGlobalLoading] = useState(false);
   const [stats, setStats] = useState<TaskStats>({ ...DEFAULT_TASK_STATS });
   const [hydrated, setHydrated] = useState(false);
+  const [backendTaskLoadError, setBackendTaskLoadError] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   
   const abortControllersRef = useRef<Map<string, AbortController>>(new Map());
@@ -216,6 +258,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const collectedCollectionKeysRef = useRef<Set<string>>(new Set());
   const requestContextByResultIdRef = useRef<Map<string, CollectionRequestSnapshot>>(new Map());
   const pendingBackendGenerateSnapshotRef = useRef<CollectionRequestSnapshot | null>(null);
+  const backendSyncedTaskPayloadRef = useRef<BackendTaskSyncPayload | null>(null);
   const lastCollectionRevisionRef = useRef(collectionRevision);
   const retrySettingsRef = useRef({ interval: retryInterval, limit: retryLimit });
   useEffect(() => {
@@ -229,7 +272,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const retryIntervalGuard = useInputGuard();
   const retryLimitGuard = useInputGuard();
   const apiProfileGuard = useInputGuard();
-  const backendPayload = React.useMemo(() => {
+  const backendPayload = React.useMemo<BackendTaskSyncPayload | null>(() => {
     if (!backendMode || !hydrated) return null;
     return {
       prompt,
@@ -238,17 +281,18 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       retryInterval,
       retryLimit,
       apiProfileId,
-      uploads: normalizeUploadsPayload(serializeUploads(fileList)),
+      uploads: normalizeUploadsPayload(serializeUploads(fileList)) as PersistedUploadImage[],
     };
   }, [backendMode, hydrated, prompt, concurrency, enableSound, retryInterval, retryLimit, apiProfileId, fileList]);
   const taskSync = useDebouncedSync({
     enabled: backendMode && hydrated,
     payload: backendPayload,
     delay: 300,
-    onSync: (payload) => {
-      void patchBackendTask(id, payload).catch((err) => {
-        console.warn('后端任务同步失败:', err);
-      });
+    onSync: async (payload) => {
+      const patch = buildBackendTaskPatch(backendSyncedTaskPayloadRef.current, payload);
+      if (Object.keys(patch).length === 0) return;
+      await patchBackendTask(id, patch);
+      backendSyncedTaskPayloadRef.current = payload;
     },
   });
   const {
@@ -397,15 +441,17 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     const storedUploads = Array.isArray(stored.uploads) ? stored.uploads : [];
     const shouldPreserveApiProfile =
       shouldPreserveApiProfileInput(nextApiProfileId, currentApiProfileId);
-    markTaskSynced({
+    const syncedTaskPayload: BackendTaskSyncPayload = {
       prompt: nextPrompt,
       concurrency: nextConcurrency,
       enableSound: nextEnableSound,
       retryInterval: nextRetryInterval,
       retryLimit: nextRetryLimit,
       apiProfileId: nextApiProfileId,
-      uploads: normalizeUploadsPayload(storedUploads),
-    });
+      uploads: normalizeUploadsPayload(storedUploads) as PersistedUploadImage[],
+    };
+    backendSyncedTaskPayloadRef.current = syncedTaskPayload;
+    markTaskSynced(syncedTaskPayload);
 
     if (!shouldPreserveApiProfile) {
       apiProfileIdRef.current = nextApiProfileId;
@@ -502,21 +548,32 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
   useEffect(() => {
     let isActive = true;
+    let backendRetryTimer: number | null = null;
     const hydrate = async () => {
       if (backendMode) {
         objectUrlMapRef.current.forEach((url) => URL.revokeObjectURL(url));
         objectUrlMapRef.current.clear();
-        try {
-          const stored = await fetchBackendTask(id);
-          if (stored && isActive) {
+        setHydrated(false);
+        setBackendTaskLoadError(false);
+        backendSyncedTaskPayloadRef.current = null;
+
+        const loadBackendTask = async () => {
+          try {
+            const stored = await fetchBackendTask(id);
+            if (!stored || !isActive) return;
             applyBackendTaskState(stored);
+            setBackendTaskLoadError(false);
+            setHydrated(true);
+          } catch (err) {
+            console.warn('后端任务初始化失败:', err);
+            if (!isActive) return;
+            setBackendTaskLoadError(true);
+            setHydrated(false);
+            backendRetryTimer = window.setTimeout(loadBackendTask, 2000);
           }
-        } catch (err) {
-          console.warn('后端任务初始化失败:', err);
-        }
-        if (isActive) {
-          setHydrated(true);
-        }
+        };
+
+        void loadBackendTask();
         return;
       }
 
@@ -603,6 +660,9 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     void hydrate();
     return () => {
       isActive = false;
+      if (backendRetryTimer) {
+        clearTimeout(backendRetryTimer);
+      }
     };
   }, [storageKey, backendMode, id]);
 
@@ -681,6 +741,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         fileList.some((file) => !file.localKey) ||
         JSON.stringify(localUploads) !== JSON.stringify(serverUploads);
       applyBackendTaskState(detail.state, { preserveUploads: shouldPreserveUploads });
+      setBackendTaskLoadError(false);
+      setHydrated(true);
     };
     window.addEventListener('backend-task-update', handler as EventListener);
     return () => {
@@ -723,34 +785,6 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       }
     });
   }, [collectionRevision]);
-
-  useEffect(() => {
-    if (!backendMode || !config.enableCollection || !onCollect) return;
-    results.forEach((result) => {
-      if (result.status !== 'success') return;
-      const endTime =
-        typeof result.endTime === 'number' ? result.endTime : result.startTime;
-      if (!endTime) return;
-      const collectionKey = buildResultCollectionKey(result.id, endTime);
-      if (collectedCollectionKeysRef.current.has(collectionKey)) return;
-      const snapshot = requestContextByResultIdRef.current.get(result.id);
-      if (!snapshot) return;
-      const requestPrompt = snapshot.prompt;
-      const resolvedSourceUrl =
-        resolveBackendDisplayUrl(result.localKey, result.sourceUrl) ||
-        result.displayUrl ||
-        result.sourceUrl;
-      void collectImageForCollection({
-        collectionKey,
-        sourceUrl: resolvedSourceUrl || undefined,
-        sourceLocalKey: result.localKey,
-        prompt: requestPrompt,
-        timestamp: endTime,
-        taskId: id,
-      });
-      collectReferenceImagesForCollection(snapshot);
-    });
-  }, [backendMode, config.enableCollection, onCollect, results, id]);
 
   useEffect(() => {
     if (!hydrated || backendMode) return;
@@ -1140,10 +1174,82 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     });
   };
 
-  const apiMarkerSegments = new Set(['projects', 'locations', 'publishers', 'models']);
-  const apiVersionPattern = /^v1(?:beta1|beta)?$/i;
-  const isVersionSegment = (value?: string) =>
-    Boolean(value && apiVersionPattern.test(value));
+  const requestOpenAiImagesEndpoint = async (
+    profile: any,
+    signal: AbortSignal,
+  ): Promise<string | null> => {
+    const apiUrl = resolveApiUrl(profile.apiUrl, 'openai');
+    const openAiBase = buildOpenAiBaseUrl(apiUrl, profile.apiVersion);
+    const referenceFiles = fileList
+      .map((file) => file.originFileObj)
+      .filter((file): file is RcFile => Boolean(file));
+    const hasReferenceImages = referenceFiles.length > 0;
+    const imageUrl = buildOpenAiImagesUrl(openAiBase, hasReferenceImages);
+    const headers = {
+      'Authorization': `Bearer ${profile.apiKey}`,
+      'x-api-key': profile.apiKey,
+    };
+
+    let response: Response;
+    if (hasReferenceImages) {
+      const formData = new FormData();
+      formData.append('model', profile.model);
+      formData.append('prompt', promptRef.current.trim());
+      referenceFiles.forEach((file) => {
+        formData.append('image', file, file.name);
+      });
+      response = await fetch(imageUrl, {
+        method: 'POST',
+        headers,
+        body: formData,
+        signal,
+      });
+    } else {
+      response = await fetch(imageUrl, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: profile.model,
+          prompt: promptRef.current.trim(),
+        }),
+        signal,
+      });
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        await formatResponseErrorMessage(response, response.statusText || '请求失败'),
+      );
+    }
+    return resolveImageFromResponse(await response.json());
+  };
+
+  const requestNovelAiImageEndpoint = async (
+    profile: any,
+    signal: AbortSignal,
+  ): Promise<string | null> => {
+    if (fileList.length > 0) {
+      throw new Error('NovelAI v1 暂不支持上传参考图，请移除参考图或使用自定义 JSON 扩展。');
+    }
+    const built = buildNovelAiRequest(profile, { prompt: promptRef.current });
+    const response = await fetch(built.url, {
+      method: 'POST',
+      headers: built.headers,
+      body: JSON.stringify(built.payload),
+      signal,
+    });
+    if (!response.ok) {
+      throw new Error(
+        await formatResponseErrorMessage(response, response.statusText || '请求失败'),
+      );
+    }
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      return resolveImageFromResponse(await response.json());
+    }
+    const image = await extractFirstImageFromNovelAiZip(await response.arrayBuffer());
+    return image?.dataUrl || null;
+  };
 
   const normalizeBase64Payload = (value: string) => value.replace(/\s+/g, '');
   const clampNumber = (value: number, min: number, max: number) =>
@@ -1236,194 +1342,6 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       parts.push({ inline_data: { mime_type: resolvedMime, data: payload } });
     }
     return [{ role: 'user', parts }];
-  };
-
-  const buildGeminiGenerationConfig = (profile: any) => {
-    const generationConfig: Record<string, unknown> = {};
-    if (profile.includeImageConfig) {
-      const imageSize = profile.imageConfig?.imageSize || '2K';
-      const aspectRatio = profile.imageConfig?.aspectRatio || 'auto';
-      const imageConfig: Record<string, string> = { imageSize };
-      if (aspectRatio && aspectRatio !== 'auto') {
-        imageConfig.aspectRatio = aspectRatio;
-      }
-      generationConfig.imageConfig = imageConfig;
-      if (profile.useResponseModalities) {
-        generationConfig.responseModalities = ['TEXT', 'IMAGE'];
-      }
-    }
-    if (profile.includeThoughts) {
-      const budget = clampNumber(
-        Math.round(typeof profile.thinkingBudget === 'number' ? profile.thinkingBudget : 128),
-        0,
-        8192,
-      );
-      generationConfig.thinkingConfig = {
-        thinkingBudget: budget,
-        includeThoughts: true,
-      };
-    }
-    return Object.keys(generationConfig).length > 0 ? generationConfig : null;
-  };
-
-  const buildGeminiSafetySettings = (profile: any) => {
-    if (!profile.includeSafetySettings || !profile.safety) return null;
-    const entries = Object.entries(profile.safety).filter(
-      ([, threshold]) => threshold && threshold !== 'OFF',
-    );
-    if (entries.length === 0) return null;
-    return entries.map(([category, threshold]) => ({
-      category,
-      threshold,
-    }));
-  };
-
-  const mergeGeminiCustomJson = (payload: Record<string, unknown>, profile: any) => {
-    const raw = typeof profile.customJson === 'string' ? profile.customJson.trim() : '';
-    if (!raw) return payload;
-    try {
-      const custom = JSON.parse(raw);
-      if (!custom || typeof custom !== 'object' || Array.isArray(custom)) {
-        return payload;
-      }
-      const mergedGenerationConfig = {
-        ...(payload.generationConfig as Record<string, unknown> | undefined),
-        ...(custom.generationConfig || {}),
-      };
-      return {
-        ...payload,
-        ...custom,
-        generationConfig:
-          Object.keys(mergedGenerationConfig).length > 0 ? mergedGenerationConfig : undefined,
-        safetySettings: custom.safetySettings ?? payload.safetySettings,
-      };
-    } catch (err) {
-      console.warn('自定义 JSON 解析失败，已忽略。', err);
-      return payload;
-    }
-  };
-
-  const buildGeminiPayload = (contents: Array<Record<string, unknown>>, profile: any) => {
-    const payload: Record<string, unknown> = { contents };
-    const generationConfig = buildGeminiGenerationConfig(profile);
-    if (generationConfig) {
-      payload.generationConfig = generationConfig;
-    }
-    const safetySettings = buildGeminiSafetySettings(profile);
-    if (safetySettings) {
-      payload.safetySettings = safetySettings;
-    }
-    return mergeGeminiCustomJson(payload, profile);
-  };
-
-  const buildGeminiRequest = (profile: any) => {
-    const apiFormat = profile.apiFormat || 'openai';
-    const format = apiFormat === 'vertex' ? 'vertex' : 'gemini';
-    const apiUrl = resolveApiUrl(profile.apiUrl, format);
-    const baseInfo = normalizeApiBase(apiUrl);
-    const baseOrigin = baseInfo.origin || apiUrl.replace(/\/+$/, '');
-    const versionFallback = format === 'vertex' ? 'v1beta1' : 'v1beta';
-    const version = resolveApiVersion(apiUrl, profile.apiVersion, versionFallback);
-    const hasVersion = Boolean(inferApiVersionFromUrl(apiUrl));
-    const segments = [...baseInfo.segments];
-
-    if (!hasVersion && version) {
-      const markerIndex = segments.findIndex((segment) => apiMarkerSegments.has(segment));
-      if (markerIndex >= 0) {
-        segments.splice(markerIndex, 0, version);
-      } else {
-        segments.push(version);
-      }
-    }
-
-    const modelValue = (profile.model || '').trim();
-    if (!modelValue) {
-      throw new Error('请填写模型名称');
-    }
-
-    const modelSegments = modelValue.split('/').filter(Boolean);
-    const modelHasProjectPath = modelSegments.includes('projects');
-    const geminiModelIsPath = modelSegments[0] === 'models';
-    const normalizedModel = geminiModelIsPath ? modelSegments.slice(1).join('/') : modelValue;
-
-    const applyModelPath = () => {
-      const modelIndex = segments.indexOf('models');
-      if (geminiModelIsPath) {
-        if (modelIndex >= 0 && modelSegments[0] === 'models') {
-          segments.splice(modelIndex + 1);
-          segments.push(...modelSegments.slice(1));
-        } else {
-          segments.push(...modelSegments);
-        }
-        return;
-      }
-      if (modelIndex >= 0) {
-        segments.splice(modelIndex + 1);
-        segments.push(modelValue);
-      } else {
-        segments.push('models', modelValue);
-      }
-    };
-
-    const ensureMarkerValue = (marker: string, value?: string) => {
-      const idx = segments.indexOf(marker);
-      if (idx === -1) {
-        if (!value) return false;
-        segments.push(marker, value);
-        return true;
-      }
-      const next = segments[idx + 1];
-      if (!next || apiMarkerSegments.has(next) || isVersionSegment(next)) {
-        if (!value) return false;
-        segments.splice(idx + 1, 0, value);
-        return true;
-      }
-      return true;
-    };
-
-    if (format === 'vertex') {
-      const projectId =
-        profile.vertexProjectId?.trim() || extractVertexProjectId(apiUrl) || '';
-      const location = profile.vertexLocation?.trim() || 'us-central1';
-      const publisher = profile.vertexPublisher?.trim() || 'google';
-      const hasProjectsMarker = segments.includes('projects');
-      const useVertexMarkers = Boolean(projectId || hasProjectsMarker || modelHasProjectPath);
-
-      if (modelHasProjectPath) {
-        segments.push(...modelSegments);
-      } else if (useVertexMarkers) {
-        if (projectId) {
-          ensureMarkerValue('projects', projectId);
-        }
-        if (segments.includes('projects') || projectId) {
-          ensureMarkerValue('locations', location);
-          ensureMarkerValue('publishers', publisher);
-        }
-        if (segments.includes('projects') || projectId) {
-          ensureMarkerValue('models', normalizedModel);
-        } else {
-          applyModelPath();
-        }
-      } else {
-        applyModelPath();
-      }
-    } else {
-      applyModelPath();
-    }
-
-    const suffix = config.stream ? ':streamGenerateContent' : ':generateContent';
-    let url = `${baseOrigin}${segments.length ? `/${segments.join('/')}` : ''}${suffix}`;
-    const headers: HeadersInit = { 'Content-Type': 'application/json' };
-    const isOfficial =
-      format === 'vertex'
-        ? baseInfo.host === 'aiplatform.googleapis.com'
-        : baseInfo.host === 'generativelanguage.googleapis.com';
-    if (isOfficial) {
-      url += `${url.includes('?') ? '&' : '?'}key=${encodeURIComponent(profile.apiKey)}`;
-    } else {
-      headers.Authorization = `Bearer ${profile.apiKey}`;
-    }
-    return { url, headers };
   };
 
   const readGeminiStream = async (response: Response) => {
@@ -1616,6 +1534,10 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
   const handleGenerate = async () => {
     const profile = getActiveProfile();
+    if (backendMode && !hydrated) {
+      message.warning('后端任务正在加载，请稍后再试');
+      return;
+    }
     if (!profile.apiKey) {
       message.error('请先配置 API Key');
       return;
@@ -1643,7 +1565,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
           uploads: serializeUploads(fileList),
         });
         pendingBackendGenerateSnapshotRef.current = requestSnapshot;
-        await generateBackendTask(id);
+        await generateBackendTask(id, { runtimeConfig: config });
       } catch (err) {
         pendingBackendGenerateSnapshotRef.current = null;
         setIsGlobalLoading(false);
@@ -1692,6 +1614,10 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
   const handleRetrySingle = (subTaskId: string) => {
     if (backendMode) {
+      if (!hydrated) {
+        message.warning('后端任务正在加载，请稍后再试');
+        return;
+      }
       requestContextByResultIdRef.current.set(
         subTaskId,
         buildCollectionRequestSnapshot(prompt),
@@ -1709,7 +1635,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         endTime: undefined,
         duration: undefined,
       });
-      void retryBackendSubTask(id, subTaskId)
+      void retryBackendSubTask(id, subTaskId, { runtimeConfig: config })
         .catch((err) => {
           updateResult(subTaskId, {
             status: 'error',
@@ -1761,115 +1687,115 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
     try {
       const profile = getActiveProfile();
-      const apiFormat = profile.apiFormat || 'openai';
+      const apiFormat = coerceApiFormat(profile.apiFormat || 'openai');
       const hasImage = fileList.length > 0;
       let imageUrl: string | null = null;
 
       if (apiFormat === 'openai') {
-        const apiUrl = resolveApiUrl(profile.apiUrl, 'openai');
-        const baseInfo = normalizeApiBase(apiUrl);
-        const basePath = baseInfo.origin
-          ? `${baseInfo.origin}${baseInfo.segments.length ? `/${baseInfo.segments.join('/')}` : ''}`
-          : apiUrl.replace(/\/+$/, '');
-        const version = resolveApiVersion(apiUrl, profile.apiVersion, 'v1');
-        const hasVersion = Boolean(inferApiVersionFromUrl(apiUrl));
-        const openAiBase = hasVersion ? basePath : `${basePath}/${version}`;
-        const chatUrl = openAiBase.endsWith('/chat/completions')
-          ? openAiBase
-          : `${openAiBase}/chat/completions`;
+        const openAiEndpointMode = profile.openaiEndpointMode === 'images' ? 'images' : 'chat';
+        if (openAiEndpointMode === 'images') {
+          imageUrl = await requestOpenAiImagesEndpoint(profile, controller.signal);
+        } else {
+          const apiUrl = resolveApiUrl(profile.apiUrl, 'openai');
+          const openAiBase = buildOpenAiBaseUrl(apiUrl, profile.apiVersion);
+          const chatUrl = buildOpenAiChatUrl(openAiBase);
 
-        const messages: any[] = [];
-        const content: any[] = [];
-        if (prompt) {
-          content.push({ type: 'text', text: prompt });
-        }
-        if (hasImage) {
-          for (const file of fileList) {
-            if (file.originFileObj) {
-              const base64 = await getBase64(file.originFileObj);
-              content.push({
-                type: 'image_url',
-                image_url: {
-                  url: base64,
-                },
-              });
-            }
+          const messages: any[] = [];
+          const content: any[] = [];
+          if (prompt) {
+            content.push({ type: 'text', text: prompt });
           }
-        }
-        messages.push({
-          role: 'user',
-          content,
-        });
-        const headers = {
-          'Authorization': `Bearer ${profile.apiKey}`,
-          'x-api-key': profile.apiKey,
-        };
-
-        if (config.stream) {
-          const fetchResponse = await fetch(chatUrl, {
-            method: 'POST',
-            headers: { ...headers, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: profile.model, messages, stream: true }),
-            signal: controller.signal,
-          });
-
-          if (!fetchResponse.ok) {
-            throw new Error(
-              await formatResponseErrorMessage(
-                fetchResponse,
-                fetchResponse.statusText || '请求失败',
-              ),
-            );
-          }
-
-          const reader = fetchResponse.body?.getReader();
-          const decoder = new TextDecoder();
-          let generatedText = '';
-          let pending = '';
-          const consumeLine = (line: string) => {
-            const cleaned = line.replace(/\r$/, '');
-            if (!cleaned.startsWith('data:')) return;
-            const payload = cleaned.slice(5).trimStart();
-            if (!payload || payload === '[DONE]') return;
-            try {
-              const json = JSON.parse(payload);
-              const delta = json.choices?.[0]?.delta;
-              if (delta?.content) generatedText += delta.content;
-              if (delta?.reasoning_content) generatedText += delta.reasoning_content;
-            } catch (e) { /* ignore */ }
-          };
-
-          if (reader) {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              pending += decoder.decode(value, { stream: true });
-              let newlineIndex = pending.indexOf('\n');
-              while (newlineIndex >= 0) {
-                const line = pending.slice(0, newlineIndex);
-                pending = pending.slice(newlineIndex + 1);
-                consumeLine(line);
-                newlineIndex = pending.indexOf('\n');
+          if (hasImage) {
+            for (const file of fileList) {
+              if (file.originFileObj) {
+                const base64 = await getBase64(file.originFileObj);
+                content.push({
+                  type: 'image_url',
+                  image_url: {
+                    url: base64,
+                  },
+                });
               }
             }
-            const tail = decoder.decode();
-            if (tail) pending += tail;
           }
-          if (pending) {
-            consumeLine(pending);
+          messages.push({
+            role: 'user',
+            content,
+          });
+          const headers = {
+            'Authorization': `Bearer ${profile.apiKey}`,
+            'x-api-key': profile.apiKey,
+          };
+
+          if (config.stream) {
+            const fetchResponse = await fetch(chatUrl, {
+              method: 'POST',
+              headers: { ...headers, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ model: profile.model, messages, stream: true }),
+              signal: controller.signal,
+            });
+
+            if (!fetchResponse.ok) {
+              throw new Error(
+                await formatResponseErrorMessage(
+                  fetchResponse,
+                  fetchResponse.statusText || '请求失败',
+                ),
+              );
+            }
+
+            const reader = fetchResponse.body?.getReader();
+            const decoder = new TextDecoder();
+            let generatedText = '';
+            let pending = '';
+            const consumeLine = (line: string) => {
+              const cleaned = line.replace(/\r$/, '');
+              if (!cleaned.startsWith('data:')) return;
+              const payload = cleaned.slice(5).trimStart();
+              if (!payload || payload === '[DONE]') return;
+              try {
+                const json = JSON.parse(payload);
+                const delta = json.choices?.[0]?.delta;
+                if (delta?.content) generatedText += delta.content;
+                if (delta?.reasoning_content) generatedText += delta.reasoning_content;
+              } catch (e) { /* ignore */ }
+            };
+
+            if (reader) {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                pending += decoder.decode(value, { stream: true });
+                let newlineIndex = pending.indexOf('\n');
+                while (newlineIndex >= 0) {
+                  const line = pending.slice(0, newlineIndex);
+                  pending = pending.slice(newlineIndex + 1);
+                  consumeLine(line);
+                  newlineIndex = pending.indexOf('\n');
+                }
+              }
+              const tail = decoder.decode();
+              if (tail) pending += tail;
+            }
+            if (pending) {
+              consumeLine(pending);
+            }
+            imageUrl = parseMarkdownImage(generatedText);
+          } else {
+            const response = await axios.post(
+              chatUrl,
+              { model: profile.model, messages, stream: false },
+              { headers: { ...headers, 'Content-Type': 'application/json' }, signal: controller.signal }
+            );
+            imageUrl = resolveImageFromResponse(response.data);
           }
-          imageUrl = parseMarkdownImage(generatedText);
-        } else {
-          const response = await axios.post(
-            chatUrl,
-            { model: profile.model, messages, stream: false },
-            { headers: { ...headers, 'Content-Type': 'application/json' }, signal: controller.signal }
-          );
-          imageUrl = resolveImageFromResponse(response.data);
         }
-      } else {
+      } else if (isGoogleApiFormat(apiFormat)) {
         const contents = await buildGeminiContents(profile);
-        const { url, headers } = buildGeminiRequest(profile);
+        const { url, headers } = buildGoogleGenerateRequest(
+          { ...profile, apiFormat },
+          { stream: Boolean(config.stream) },
+        );
         const payload = buildGeminiPayload(contents, profile);
         const response = await fetch(url, {
           method: 'POST',
@@ -1884,6 +1810,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         }
         const data = config.stream ? await readGeminiStream(response) : await response.json();
         imageUrl = resolveImageFromResponse(data);
+      } else if (apiFormat === 'novelai') {
+        imageUrl = await requestNovelAiImageEndpoint(profile, controller.signal);
       }
       
       if (imageUrl) {
@@ -2028,6 +1956,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (backendMode && !hydrated) return;
     if (!isDragOver) setIsDragOver(true);
   };
 
@@ -2042,6 +1971,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     e.preventDefault();
     e.stopPropagation();
     setIsDragOver(false);
+    if (backendMode && !hydrated) return;
 
     const files = Array.from(e.dataTransfer.files).filter((file) =>
       file.type.startsWith('image/'),
@@ -2062,6 +1992,10 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   };
 
   const handleUploadChange = ({ fileList: newFileList }: { fileList: UploadFile[] }) => {
+    if (backendMode && !hydrated) {
+      message.warning('后端任务正在加载，请稍后再试');
+      return;
+    }
     const fromCollectionMap = new Map(
       fileList.map((file) => [file.uid, file.fromCollection]),
     );
@@ -2157,6 +2091,12 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   
   const fastestTimeStr = formatDuration(stats.fastestTime);
   const slowestTimeStr = formatDuration(stats.slowestTime);
+  const backendTaskWaiting = backendMode && !hydrated;
+  const promptPlaceholder = backendTaskWaiting
+    ? backendTaskLoadError
+      ? '后端任务加载失败，正在重试...'
+      : '正在从后端加载...'
+    : '在此描述您的想象...';
 
   return (
     <div
@@ -2281,6 +2221,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
               variant="borderless"
               popupMatchSelectWidth={false}
               dropdownStyle={{ minWidth: 120, borderRadius: 8 }}
+              disabled={backendTaskWaiting}
             />
           </div>
         </Space>
@@ -2353,7 +2294,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
               <TextArea 
                 ref={promptTextareaRef}
                 className="sticky-note-textarea"
-                placeholder="在此描述您的想象..." 
+                placeholder={promptPlaceholder}
                 value={prompt} 
                 onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => handlePromptChange(e.target.value)}
                 onFocus={handlePromptFocus}
@@ -2362,6 +2303,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                 onPaste={handlePromptPaste}
                 autoSize={{ minRows: 2, maxRows: 15 }}
                 variant="borderless"
+                disabled={backendTaskWaiting}
               />
             </div>
             <div className="sticky-note-fold-effect bottom" />
@@ -2416,13 +2358,15 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                 beforeUpload={() => false}
                 multiple
                 showUploadList={false}
+                disabled={backendTaskWaiting}
               >
                 <Tooltip title="上传参考图">
-                  <Button 
-                    size="small" 
-                    icon={<UploadOutlined />} 
-                    style={fileList.length > 0 ? { 
-                      background: '#FF9EB5', color: '#fff', border: 'none' 
+                  <Button
+                    size="small"
+                    icon={<UploadOutlined />}
+                    disabled={backendTaskWaiting}
+                    style={fileList.length > 0 ? {
+                      background: '#FF9EB5', color: '#fff', border: 'none'
                     } : { 
                       background: '#fff', color: '#998888', border: '1px solid #E8E8E8' 
                     }}
@@ -2534,6 +2478,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                 icon={<FireFilled />} 
                 onClick={handleGenerate} 
                 size="small"
+                disabled={backendTaskWaiting}
                 style={{ borderRadius: 16, padding: '0 20px', height: 32, fontWeight: 700 }}
               >
                 生成

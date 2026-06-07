@@ -1,6 +1,7 @@
 ﻿import express from 'express'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import { createServer as createHttpServer } from 'node:http'
 import path from 'node:path'
 import {
   backendImagesDir,
@@ -15,6 +16,7 @@ import {
   DEFAULT_CONCURRENCY,
   DEFAULT_GLOBAL_STATS,
   DEFAULT_TASK_STATS,
+  coerceApiFormat,
   pickFormatConfig,
 } from './server/config.mjs'
 import {
@@ -41,6 +43,18 @@ import {
 } from './server/storage.mjs'
 import { parseMarkdownImage, resolveImageFromResponse } from './server/imageParser.mjs'
 import { getMimeFromFilename, saveBackendImageBuffer, saveImageBuffer } from './server/imageStore.mjs'
+import {
+  buildGeminiPayload,
+  buildGoogleGenerateRequest,
+  buildNovelAiRequest,
+  buildOpenAiBaseUrl,
+  buildOpenAiChatUrl,
+  buildOpenAiImagesUrl,
+  coerceApiFormat as coerceProviderApiFormat,
+  extractFirstImageFromNovelAiZip,
+  isGoogleApiFormat,
+  resolveApiUrl,
+} from './src/utils/providerRequests.mjs'
 
 const readRequestBody = async (req) => {
   const chunks = []
@@ -229,6 +243,7 @@ const parseDataUrl = (dataUrl = '') => {
 
 const activeControllers = new Map()
 const retryTimers = new Map()
+const runtimeTaskConfigs = new Map()
 
 const clearRetryTimer = (subTaskId) => {
   const timer = retryTimers.get(subTaskId)
@@ -272,8 +287,8 @@ const updateGlobalStats = async (type, duration, count) => {
   await saveBackendState({ ...state, globalStats: stats })
 }
 
-const resolveTaskApiConfig = (taskState, backendState) => {
-  const baseConfig = backendState?.config || {}
+const resolveTaskApiConfig = (taskState, backendState, runtimeConfig) => {
+  const baseConfig = runtimeConfig || backendState?.config || {}
   const profiles = Array.isArray(baseConfig.apiProfiles) ? baseConfig.apiProfiles : []
   const taskProfileId = typeof taskState?.apiProfileId === 'string' ? taskState.apiProfileId : ''
   const matchedProfile = taskProfileId
@@ -312,81 +327,6 @@ const buildMessagesForTask = async (taskState) => {
   return [{ role: 'user', content }]
 }
 
-const API_VERSION_REGEX = /^v1(?:beta1|beta)?$/i
-const apiMarkerSegments = new Set(['projects', 'locations', 'publishers', 'models'])
-const isVersionSegment = (value) => API_VERSION_REGEX.test(String(value || ''))
-
-const DEFAULT_API_BASES = {
-  openai: 'https://api.openai.com/v1',
-  gemini: 'https://generativelanguage.googleapis.com',
-  vertex: 'https://aiplatform.googleapis.com',
-}
-
-const ensureProtocol = (value) =>
-  /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`
-
-const resolveApiUrl = (apiUrl, apiFormat) => {
-  const trimmed = String(apiUrl || '').trim()
-  if (trimmed) return trimmed
-  return DEFAULT_API_BASES[apiFormat] || DEFAULT_API_BASES.openai
-}
-
-const normalizeApiBase = (apiUrl = '') => {
-  const cleaned = String(apiUrl).trim().replace(/\/+$/, '')
-  if (!cleaned) {
-    return { origin: '', segments: [], host: '' }
-  }
-  try {
-    const url = new URL(ensureProtocol(cleaned))
-    return {
-      origin: `${url.protocol}//${url.host}`,
-      segments: url.pathname.split('/').filter(Boolean),
-      host: url.host.toLowerCase(),
-    }
-  } catch {
-    return { origin: cleaned, segments: [], host: '' }
-  }
-}
-
-const extractVertexProjectId = (apiUrl = '') => {
-  const { segments } = normalizeApiBase(apiUrl)
-  const index = segments.indexOf('projects')
-  if (index < 0) return null
-  const candidate = segments[index + 1]
-  if (!candidate) return null
-  if (apiMarkerSegments.has(candidate)) return null
-  if (API_VERSION_REGEX.test(candidate)) return null
-  return candidate
-}
-
-const inferApiVersionFromUrl = (apiUrl = '') => {
-  const cleaned = String(apiUrl).trim()
-  if (!cleaned) return null
-  try {
-    const url = new URL(ensureProtocol(cleaned))
-    const segments = url.pathname.split('/').filter(Boolean)
-    for (let i = segments.length - 1; i >= 0; i -= 1) {
-      const segment = segments[i]
-      if (API_VERSION_REGEX.test(segment)) return segment
-    }
-    return null
-  } catch {
-    const segments = cleaned.split('/').filter(Boolean)
-    for (let i = segments.length - 1; i >= 0; i -= 1) {
-      const segment = segments[i]
-      if (API_VERSION_REGEX.test(segment)) return segment
-    }
-    return null
-  }
-}
-
-const resolveApiVersion = (apiUrl, apiVersion, fallback) => {
-  const inferred = inferApiVersionFromUrl(apiUrl)
-  if (inferred) return inferred
-  const trimmed = String(apiVersion || '').trim()
-  return trimmed || fallback
-}
-
 const buildGeminiContentsFromMessages = (messages = []) => {
   const parts = []
   messages.forEach((message) => {
@@ -413,121 +353,6 @@ const buildGeminiContentsFromMessages = (messages = []) => {
     })
   })
   return [{ role: 'user', parts }]
-}
-
-const buildGeminiRequest = (config) => {
-  const apiFormat = config?.apiFormat || 'openai'
-  const format = apiFormat === 'vertex' ? 'vertex' : 'gemini'
-  const apiUrl = resolveApiUrl(config?.apiUrl, format)
-  const baseInfo = normalizeApiBase(apiUrl)
-  const baseOrigin = baseInfo.origin || String(apiUrl || '').replace(/\/+$/, '')
-  const versionFallback = format === 'vertex' ? 'v1beta1' : 'v1beta'
-  const version = resolveApiVersion(apiUrl, config?.apiVersion, versionFallback)
-  const hasVersion = Boolean(inferApiVersionFromUrl(apiUrl))
-  const segments = [...baseInfo.segments]
-
-  if (!hasVersion && version) {
-    const markerIndex = segments.findIndex((segment) => apiMarkerSegments.has(segment))
-    if (markerIndex >= 0) {
-      segments.splice(markerIndex, 0, version)
-    } else {
-      segments.push(version)
-    }
-  }
-
-  const modelValue = String(config?.model || '').trim()
-  if (!modelValue) {
-    throw new Error('模型名称未配置')
-  }
-
-  const modelSegments = modelValue.split('/').filter(Boolean)
-  const modelHasProjectPath = modelSegments.includes('projects')
-  const geminiModelIsPath = modelSegments[0] === 'models'
-  const normalizedModel = geminiModelIsPath ? modelSegments.slice(1).join('/') : modelValue
-
-  const applyModelPath = () => {
-    const modelIndex = segments.indexOf('models')
-    if (geminiModelIsPath) {
-      if (modelIndex >= 0 && modelSegments[0] === 'models') {
-        segments.splice(modelIndex + 1)
-        segments.push(...modelSegments.slice(1))
-      } else {
-        segments.push(...modelSegments)
-      }
-      return
-    }
-    if (modelIndex >= 0) {
-      segments.splice(modelIndex + 1)
-      segments.push(modelValue)
-    } else {
-      segments.push('models', modelValue)
-    }
-  }
-
-  const ensureMarkerValue = (marker, value) => {
-    const idx = segments.indexOf(marker)
-    if (idx === -1) {
-      if (!value) return false
-      segments.push(marker, value)
-      return true
-    }
-    const next = segments[idx + 1]
-    if (!next || apiMarkerSegments.has(next) || isVersionSegment(next)) {
-      if (!value) return false
-      segments.splice(idx + 1, 0, value)
-      return true
-    }
-    return true
-  }
-
-  if (format === 'vertex') {
-    const projectId =
-      String(config?.vertexProjectId || '').trim() ||
-      extractVertexProjectId(apiUrl) ||
-      ''
-    const location = String(config?.vertexLocation || '').trim() || 'us-central1'
-    const publisher = String(config?.vertexPublisher || '').trim() || 'google'
-    const hasProjectsMarker = segments.includes('projects')
-    const useVertexMarkers = Boolean(projectId || hasProjectsMarker || modelHasProjectPath)
-
-    if (modelHasProjectPath) {
-      segments.push(...modelSegments)
-    } else if (useVertexMarkers) {
-      if (projectId) {
-        ensureMarkerValue('projects', projectId)
-      }
-      if (segments.includes('projects') || projectId) {
-        ensureMarkerValue('locations', location)
-        ensureMarkerValue('publishers', publisher)
-      }
-      if (segments.includes('projects') || projectId) {
-        ensureMarkerValue('models', normalizedModel)
-      } else {
-        applyModelPath()
-      }
-    } else {
-      applyModelPath()
-    }
-  } else {
-    applyModelPath()
-  }
-
-  const suffix = config?.stream ? ':streamGenerateContent' : ':generateContent'
-  let url = `${baseOrigin}${segments.length ? `/${segments.join('/')}` : ''}${suffix}`
-  const headers = {
-    'Content-Type': 'application/json',
-    Connection: 'close',
-  }
-  const isOfficial =
-    format === 'vertex'
-      ? baseInfo.host === 'aiplatform.googleapis.com'
-      : baseInfo.host === 'generativelanguage.googleapis.com'
-  if (isOfficial) {
-    url += `${url.includes('?') ? '&' : '?'}key=${encodeURIComponent(config?.apiKey || '')}`
-  } else {
-    headers.Authorization = `Bearer ${config?.apiKey || ''}`
-  }
-  return { url, headers }
 }
 
 const readGeminiStream = async (response) => {
@@ -680,6 +505,149 @@ const readResponseError = async (response) => {
   })
 }
 
+const imageExtensionFromMime = (mime = '') => {
+  const lower = String(mime).toLowerCase()
+  if (lower.includes('jpeg') || lower.includes('jpg')) return '.jpg'
+  if (lower.includes('webp')) return '.webp'
+  if (lower.includes('gif')) return '.gif'
+  if (lower.includes('bmp')) return '.bmp'
+  return '.png'
+}
+
+const extractOpenAiImagesPayload = (messages = []) => {
+  const promptParts = []
+  const images = []
+  messages.forEach((message) => {
+    const content = Array.isArray(message?.content) ? message.content : []
+    content.forEach((part) => {
+      if (part?.type === 'text' && typeof part.text === 'string') {
+        promptParts.push(part.text)
+      }
+      if (part?.type === 'image_url') {
+        const url = part?.image_url?.url || part?.image_url
+        if (typeof url !== 'string') return
+        const parsed = parseDataUrl(url)
+        if (!parsed?.buffer) return
+        images.push(parsed)
+      }
+    })
+  })
+  return {
+    prompt: promptParts.join('\n\n').trim(),
+    images,
+  }
+}
+
+const requestOpenAiImageEndpoint = async (config, messages, openAiBase, signal) => {
+  const { prompt, images } = extractOpenAiImagesPayload(messages)
+  const hasReferenceImages = images.length > 0
+  const url = buildOpenAiImagesUrl(openAiBase, hasReferenceImages)
+  const requestInfo = {
+    url,
+    model: config.model,
+    stream: false,
+    endpoint: hasReferenceImages ? 'images-edits' : 'images-generations',
+  }
+  const headers = {
+    Authorization: `Bearer ${config.apiKey}`,
+    'x-api-key': config.apiKey,
+    Connection: 'close',
+  }
+  let body
+  if (hasReferenceImages) {
+    const formData = new FormData()
+    formData.append('model', config.model)
+    formData.append('prompt', prompt)
+    images.forEach((image, index) => {
+      const contentType = image.contentType || 'image/png'
+      const blob = new Blob([image.buffer], { type: contentType })
+      formData.append(
+        'image',
+        blob,
+        `image-${index + 1}${imageExtensionFromMime(contentType)}`,
+      )
+    })
+    body = formData
+  } else {
+    headers['Content-Type'] = 'application/json'
+    body = JSON.stringify({ model: config.model, prompt })
+  }
+
+  logBackendOutbound('api-request', requestInfo)
+  let response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body,
+      signal,
+    })
+  } catch (err) {
+    logBackendOutbound('api-request-error', {
+      ...requestInfo,
+      error: describeFetchError(err),
+    })
+    throw err
+  }
+  logBackendOutbound('api-response', { ...requestInfo, status: response.status })
+  if (!response.ok) {
+    const message = await readResponseError(response)
+    logBackendResponse('json-error', { status: response.status, message })
+    throw new Error(message)
+  }
+  const data = await response.json()
+  const imageUrl = resolveImageFromResponse(data)
+  if (!imageUrl) {
+    logBackendResponse('json-response', data)
+  }
+  return imageUrl
+}
+
+const requestNovelAiImageEndpoint = async (config, messages, signal) => {
+  const { prompt, images } = extractOpenAiImagesPayload(messages)
+  if (images.length > 0) {
+    throw new Error('NovelAI v1 暂不支持上传参考图，请移除参考图或使用自定义 JSON 扩展。')
+  }
+  const built = buildNovelAiRequest(config, { prompt })
+  const requestInfo = {
+    url: built.url,
+    model: config.model,
+    stream: false,
+    format: 'novelai',
+  }
+  logBackendOutbound('api-request', requestInfo)
+  let response
+  try {
+    response = await fetch(built.url, {
+      method: 'POST',
+      headers: { ...built.headers, Connection: 'close' },
+      body: JSON.stringify(built.payload),
+      signal,
+    })
+  } catch (err) {
+    logBackendOutbound('api-request-error', {
+      ...requestInfo,
+      error: describeFetchError(err),
+    })
+    throw err
+  }
+  logBackendOutbound('api-response', { ...requestInfo, status: response.status })
+  if (!response.ok) {
+    const message = await readResponseError(response)
+    logBackendResponse('novelai-error', { status: response.status, message })
+    throw new Error(message)
+  }
+  const contentType = response.headers.get('content-type') || ''
+  if (contentType.includes('application/json')) {
+    const data = await response.json()
+    const imageUrl = resolveImageFromResponse(data)
+    if (!imageUrl) logBackendResponse('json-response', data)
+    return imageUrl
+  }
+  const image = await extractFirstImageFromNovelAiZip(await response.arrayBuffer())
+  return image?.dataUrl || null
+}
+
 const requestImageUrl = async (config, messages, signal) => {
   if (!config?.apiKey) {
     throw new Error('API Key 未配置')
@@ -688,10 +656,9 @@ const requestImageUrl = async (config, messages, signal) => {
     throw new Error('模型名称未配置')
   }
 
-  const apiFormat = config?.apiFormat || 'openai'
-  const apiUrl = resolveApiUrl(config?.apiUrl, apiFormat === 'vertex' ? 'vertex' : apiFormat)
+  const apiFormat = coerceProviderApiFormat(config?.apiFormat)
 
-  if (apiFormat !== 'openai') {
+  if (isGoogleApiFormat(apiFormat)) {
     const requestInfo = {
       url: '',
       model: config.model,
@@ -702,13 +669,17 @@ const requestImageUrl = async (config, messages, signal) => {
     let data
     try {
       const contents = buildGeminiContentsFromMessages(messages)
-      const built = buildGeminiRequest(config)
+      const built = buildGoogleGenerateRequest(
+        { ...config, apiFormat },
+        { stream: Boolean(config.stream) },
+      )
+      const payload = buildGeminiPayload(contents, config)
       requestInfo.url = built.url
       logBackendOutbound('api-request', requestInfo)
       response = await fetch(built.url, {
         method: 'POST',
-        headers: built.headers,
-        body: JSON.stringify({ contents }),
+        headers: { ...built.headers, Connection: 'close' },
+        body: JSON.stringify(payload),
         signal,
       })
       if (!response.ok) {
@@ -733,16 +704,16 @@ const requestImageUrl = async (config, messages, signal) => {
     return imageUrl
   }
 
-  const baseInfo = normalizeApiBase(apiUrl)
-  const basePath = baseInfo.origin
-    ? `${baseInfo.origin}${baseInfo.segments.length ? `/${baseInfo.segments.join('/')}` : ''}`
-    : String(apiUrl || '').replace(/\/+$/, '')
-  const version = resolveApiVersion(apiUrl, config.apiVersion, 'v1')
-  const hasVersion = Boolean(inferApiVersionFromUrl(apiUrl))
-  const openAiBase = hasVersion ? basePath : `${basePath}/${version}`
-  const chatUrl = openAiBase.endsWith('/chat/completions')
-    ? openAiBase
-    : `${openAiBase}/chat/completions`
+  if (apiFormat === 'novelai') {
+    return requestNovelAiImageEndpoint(config, messages, signal)
+  }
+
+  const apiUrl = resolveApiUrl(config?.apiUrl, 'openai')
+  const openAiBase = buildOpenAiBaseUrl(apiUrl, config.apiVersion)
+  if (config.openaiEndpointMode === 'images') {
+    return requestOpenAiImageEndpoint(config, messages, openAiBase, signal)
+  }
+  const chatUrl = buildOpenAiChatUrl(openAiBase)
   const headers = {
     Authorization: `Bearer ${config.apiKey}`,
     'x-api-key': config.apiKey,
@@ -992,7 +963,11 @@ const runSubTask = async (taskId, subTaskId, options = {}) => {
 
   try {
     const backendState = await loadBackendState()
-    const taskApiConfig = resolveTaskApiConfig(taskState, backendState)
+    const taskApiConfig = resolveTaskApiConfig(
+      taskState,
+      backendState,
+      runtimeTaskConfigs.get(taskId),
+    )
     const shouldCollect = Boolean(backendState?.config?.enableCollection)
     const messages = await buildMessagesForTask(taskState)
     const imageUrl = await requestImageUrl(taskApiConfig, messages, controller.signal)
@@ -1206,6 +1181,7 @@ const stopSubTask = async (taskId, subTaskId, mode = 'pause') => {
 }
 
 const app = express()
+const httpServer = createHttpServer(app)
 
 app.use(express.json({ limit: '50mb' }))
 if (backendLogRequests) {
@@ -1259,6 +1235,29 @@ const requireBackendAuth = (req, res, next) => {
     return
   }
   next()
+}
+
+const applyBackendConfigPayload = async (payload = {}) => {
+  if (!payload?.config && !payload?.configByFormat) return null
+  const current = await loadBackendState()
+  const next = { ...current }
+  if (payload?.configByFormat) {
+    const incoming = payload.configByFormat
+    if (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) {
+      next.configByFormat = { ...next.configByFormat, ...incoming }
+    }
+  }
+  if (payload?.config) {
+    next.config = { ...DEFAULT_BACKEND_CONFIG, ...payload.config }
+    const apiFormat = coerceApiFormat(next.config.apiFormat)
+    next.config.apiFormat = apiFormat
+    next.configByFormat = {
+      ...next.configByFormat,
+      [apiFormat]: pickFormatConfig(next.config),
+    }
+  }
+  await saveBackendState(next)
+  return next
 }
 
 app.post('/api/backend/auth', async (req, res) => {
@@ -1319,10 +1318,7 @@ app.patch('/api/backend/state', requireBackendAuth, async (req, res) => {
     }
     if (req.body?.config) {
       next.config = { ...DEFAULT_BACKEND_CONFIG, ...req.body.config }
-      const apiFormat =
-        next.config.apiFormat === 'gemini' || next.config.apiFormat === 'vertex'
-          ? next.config.apiFormat
-          : 'openai'
+      const apiFormat = coerceApiFormat(next.config.apiFormat)
       next.config.apiFormat = apiFormat
       next.configByFormat = {
         ...next.configByFormat,
@@ -1449,6 +1445,7 @@ app.patch('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
 
 app.delete('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
   try {
+    runtimeTaskConfigs.delete(req.params.id)
     const existing = await loadTaskState(req.params.id)
     const removedKeys = existing ? Array.from(collectImageKeysFromTask(existing)) : []
     if (existing?.results) {
@@ -1479,6 +1476,9 @@ app.delete('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
 
 app.post('/api/backend/task/:id/generate', requireBackendAuth, async (req, res) => {
   try {
+    if (req.body?.runtimeConfig) {
+      runtimeTaskConfigs.set(req.params.id, req.body.runtimeConfig)
+    }
     await startGeneration(req.params.id)
     res.status(204).end()
   } catch (err) {
@@ -1493,6 +1493,9 @@ app.post('/api/backend/task/:id/retry', requireBackendAuth, async (req, res) => 
     if (!subTaskId) {
       res.status(400).json({ error: 'Missing subTaskId' })
       return
+    }
+    if (req.body?.runtimeConfig) {
+      runtimeTaskConfigs.set(req.params.id, req.body.runtimeConfig)
     }
     const state = await retrySubTask(req.params.id, subTaskId)
     if (!state) {
@@ -1621,7 +1624,13 @@ if (isProd) {
   const { createServer: createViteServer } = await import('vite')
   const vite = await createViteServer({
     root: rootDir,
-    server: { middlewareMode: true },
+    server: {
+      middlewareMode: true,
+      hmr: { server: httpServer },
+      watch: {
+        ignored: ['**/server-data/**', '**/saved-images/**', '**/dist/**'],
+      },
+    },
     appType: 'custom',
   })
 
@@ -1639,7 +1648,7 @@ if (isProd) {
   })
 }
 
-app.listen(port, () => {
+httpServer.listen(port, () => {
   console.log(`[server] http://localhost:${port} (${isProd ? 'prod' : 'dev'})`)
 })
 

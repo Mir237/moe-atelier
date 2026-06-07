@@ -50,6 +50,11 @@ import {
   resolveApiUrl,
   resolveApiVersion,
 } from './utils/apiUrl';
+import {
+  API_FORMATS,
+  coerceApiFormat,
+  getApiVersionFallback,
+} from './utils/providerRequests.mjs';
 import { safeStorageSet } from './utils/storage';
 import { calculateSuccessRate, formatDuration } from './utils/stats';
 import { TASK_STATE_VERSION, saveTaskState, DEFAULT_TASK_STATS } from './components/imageTaskState';
@@ -79,9 +84,34 @@ const EMPTY_GLOBAL_STATS: GlobalStats = {
   slowestTime: 0,
   totalTime: 0,
 };
-const API_FORMATS: ApiFormat[] = ['openai', 'gemini', 'vertex'];
-
 type FormatConfigMap = Record<ApiFormat, FormatConfig>;
+
+const API_PROFILE_FIELD_KEYS = [
+  'apiUrl',
+  'apiKey',
+  'model',
+  'apiFormat',
+  'openaiEndpointMode',
+  'apiVersion',
+  'vertexProjectId',
+  'vertexLocation',
+  'vertexPublisher',
+  'thinkingBudget',
+  'includeThoughts',
+  'includeImageConfig',
+  'includeSafetySettings',
+  'safety',
+  'imageConfig',
+  'webpQuality',
+  'useResponseModalities',
+  'customJson',
+] as const;
+
+const pickApiProfileFields = (config: AppConfig) =>
+  API_PROFILE_FIELD_KEYS.reduce((acc, key) => {
+    (acc as Record<string, unknown>)[key] = config[key];
+    return acc;
+  }, {} as Omit<AppConfig, 'apiProfiles' | 'activeApiProfileId' | 'stream' | 'enableCollection'>);
 
 const buildBackendFormatConfigs = (
   value: unknown,
@@ -101,8 +131,9 @@ const buildBackendFormatConfigs = (
     });
   }
   if (fallbackConfig?.apiFormat) {
-    next[fallbackConfig.apiFormat] = {
-      ...next[fallbackConfig.apiFormat],
+    const fallbackFormat = coerceApiFormat(fallbackConfig.apiFormat);
+    next[fallbackFormat] = {
+      ...next[fallbackFormat],
       ...buildFormatConfig(fallbackConfig),
     };
   }
@@ -131,8 +162,11 @@ function App() {
   const [backendPassword, setBackendPassword] = useState('');
   const [backendAuthLoading, setBackendAuthLoading] = useState(false);
   const [backendSyncing, setBackendSyncing] = useState(false);
+  const [apiConfigDirty, setApiConfigDirty] = useState(false);
   const backendModeRef = useRef(initialBackendMode);
   const configRef = useRef(config);
+  const persistedConfigRef = useRef(config);
+  const apiConfigDirtyRef = useRef(false);
   const backendFormatConfigsRef = useRef<FormatConfigMap>(
     buildBackendFormatConfigs(null),
   );
@@ -148,14 +182,12 @@ function App() {
   const collectionCountRef = useRef(collectedItems.length);
   const configGuard = useInputGuard({ idleMs: 700 });
   const backendConfigPayload =
-    backendMode && backendReadyRef.current
+    backendMode && backendReadyRef.current && !apiConfigDirty
       ? { config, configByFormat: backendFormatConfigsRef.current }
       : null;
   const syncBackendConfig = useCallback(
-    (payload: { config: AppConfig; configByFormat: FormatConfigMap }) => {
-      void patchBackendState(payload).catch((err) => {
-        console.warn('后端配置同步失败:', err);
-      });
+    async (payload: { config: AppConfig; configByFormat: FormatConfigMap }) => {
+      await patchBackendState(payload);
     },
     [],
   );
@@ -179,6 +211,7 @@ function App() {
       backendApplyingRef.current = true;
       backendReadyRef.current = true;
       if (state?.config) {
+        persistedConfigRef.current = state.config;
         const formatConfigs = buildBackendFormatConfigs(
           state.configByFormat,
           state.config,
@@ -186,13 +219,11 @@ function App() {
         const incomingKey = JSON.stringify(state.config);
         const currentKey = JSON.stringify(configRef.current);
         const preserveConfig =
-          !backendBootstrappingRef.current && shouldPreserveConfig(incomingKey, currentKey);
+          apiConfigDirtyRef.current ||
+          (!backendBootstrappingRef.current && shouldPreserveConfig(incomingKey, currentKey));
         if (preserveConfig) {
           const localConfig = configRef.current;
-          const localFormat =
-            localConfig.apiFormat === 'gemini' || localConfig.apiFormat === 'vertex'
-              ? localConfig.apiFormat
-              : 'openai';
+          const localFormat = coerceApiFormat(localConfig.apiFormat);
           formatConfigs[localFormat] = {
             ...formatConfigs[localFormat],
             ...buildFormatConfig(localConfig),
@@ -204,6 +235,7 @@ function App() {
         } else {
           backendFormatConfigsRef.current = formatConfigs;
           setConfig(state.config);
+          setApiConfigDirty(false);
           clearConfigDirty();
         }
         markConfigSynced({
@@ -280,6 +312,8 @@ function App() {
       backendModeRef.current = false;
       setBackendModeState(false);
       const localConfig = loadConfig();
+      persistedConfigRef.current = localConfig;
+      setApiConfigDirty(false);
       setConfig(localConfig);
       setTasks(loadTasks());
       setGlobalStats(loadGlobalStats());
@@ -304,6 +338,8 @@ function App() {
     backendBootstrappingRef.current = false;
     setBackendModeState(false);
     const localConfig = loadConfig();
+    persistedConfigRef.current = localConfig;
+    setApiConfigDirty(false);
     setConfig(localConfig);
     setTasks(loadTasks());
     setGlobalStats(loadGlobalStats());
@@ -343,6 +379,10 @@ function App() {
   React.useEffect(() => {
     configRef.current = config;
   }, [config]);
+
+  React.useEffect(() => {
+    apiConfigDirtyRef.current = apiConfigDirty;
+  }, [apiConfigDirty]);
 
   React.useEffect(() => {
     if (!configVisible) {
@@ -468,8 +508,10 @@ function App() {
   React.useEffect(() => {
     if (backendMode) return;
     if (localHydratingRef.current) return;
+    if (apiConfigDirty) return;
     saveConfig(config);
-  }, [config, backendMode]);
+    persistedConfigRef.current = config;
+  }, [config, backendMode, apiConfigDirty]);
 
   React.useEffect(() => {
     if (backendMode) {
@@ -533,14 +575,27 @@ function App() {
         console.warn('解析后端任务事件失败:', err);
       }
     };
+    const handleCollection = (event: MessageEvent) => {
+      if (!backendModeRef.current) return;
+      try {
+        const items = JSON.parse(event.data || '[]') as CollectionItem[];
+        if (!Array.isArray(items)) return;
+        backendCollectionLastPayloadRef.current = JSON.stringify(items);
+        setCollectedItems(items);
+      } catch (err) {
+        console.warn('解析后端收藏事件失败:', err);
+      }
+    };
     source.addEventListener('state', handleState as EventListener);
     source.addEventListener('task', handleTask as EventListener);
+    source.addEventListener('collection', handleCollection as EventListener);
     source.onerror = () => {
       console.warn('后端事件流断开，等待自动重连');
     };
     return () => {
       source.removeEventListener('state', handleState as EventListener);
       source.removeEventListener('task', handleTask as EventListener);
+      source.removeEventListener('collection', handleCollection as EventListener);
       source.close();
     };
   }, [backendMode, applyBackendState]);
@@ -554,10 +609,17 @@ function App() {
 
     setLoadingModels(true);
     try {
-      const apiFormat = currentConfig.apiFormat || 'openai';
+      const apiFormat = coerceApiFormat(currentConfig.apiFormat || 'openai');
+      if (apiFormat === 'novelai') {
+        message.warning('NovelAI 模型列表暂不支持自动获取');
+        return;
+      }
+      if (apiFormat === 'vertex') {
+        message.warning('Vertex 标准模式模型列表暂不支持自动获取');
+        return;
+      }
       const apiUrl = resolveApiUrl(currentConfig.apiUrl, apiFormat);
-      const versionFallback =
-        apiFormat === 'openai' ? 'v1' : apiFormat === 'vertex' ? 'v1beta1' : 'v1beta';
+      const versionFallback = getApiVersionFallback(apiFormat);
       const version = resolveApiVersion(
         apiUrl,
         currentConfig.apiVersion,
@@ -576,34 +638,46 @@ function App() {
         const openAiBase = hasVersion ? basePath : `${basePath}/${version}`;
         url = openAiBase.endsWith('/models') ? openAiBase : `${openAiBase}/models`;
         headers.Authorization = `Bearer ${currentConfig.apiKey}`;
-      } else if (apiFormat === 'gemini') {
+      } else if (apiFormat === 'gemini' || apiFormat === 'vertex-express') {
         const segments = [...baseInfo.segments];
         if (!inferApiVersionFromUrl(apiUrl)) {
+          const markerIndex = segments.findIndex((segment) =>
+            ['publishers', 'models'].includes(segment),
+          );
+          if (markerIndex >= 0) segments.splice(markerIndex, 0, version);
+          else segments.push(version);
+        }
+        if (apiFormat === 'vertex-express') {
+          const publisherIndex = segments.indexOf('publishers');
+          if (publisherIndex >= 0) {
+            segments.splice(publisherIndex + 1);
+            segments.push(currentConfig.vertexPublisher || 'google', 'models');
+          } else {
+            segments.push('publishers', currentConfig.vertexPublisher || 'google', 'models');
+          }
+        } else {
           const modelIndex = segments.indexOf('models');
           if (modelIndex >= 0) {
-            segments.splice(modelIndex, 0, version);
+            segments.splice(modelIndex + 1);
           } else {
-            segments.push(version);
+            segments.push('models');
           }
         }
-        const modelIndex = segments.indexOf('models');
-        if (modelIndex >= 0) {
-          segments.splice(modelIndex + 1);
-        } else {
-          segments.push('models');
-        }
-        const geminiBase = baseInfo.origin
+        const modelBase = baseInfo.origin
           ? `${baseInfo.origin}/${segments.join('/')}`
           : `${segments.join('/')}`;
-        const isOfficial = baseInfo.host === 'generativelanguage.googleapis.com';
+        const isOfficial =
+          apiFormat === 'gemini'
+            ? baseInfo.host === 'generativelanguage.googleapis.com'
+            : baseInfo.host === 'aiplatform.googleapis.com';
         if (isOfficial) {
-          url = `${geminiBase}?key=${encodeURIComponent(currentConfig.apiKey)}`;
+          url = `${modelBase}?key=${encodeURIComponent(currentConfig.apiKey)}`;
         } else {
-          url = geminiBase;
+          url = modelBase;
           headers.Authorization = `Bearer ${currentConfig.apiKey}`;
         }
       } else {
-        message.warning('Vertex 模型列表暂不支持自动获取');
+        message.warning('当前 API 格式暂不支持自动获取模型列表');
         return;
       }
 
@@ -638,7 +712,9 @@ function App() {
           .map((m: any) => {
             const rawName =
               typeof m?.name === 'string' ? m.name : typeof m?.id === 'string' ? m.id : '';
-            const name = rawName.replace(/^models\//, '');
+            const name = rawName
+              .replace(/^models\//, '')
+              .replace(/^publishers\/[^/]+\/models\//, '');
             return name ? { label: name, value: name } : null;
           })
           .filter((item: any) => item && item.value)
@@ -812,48 +888,47 @@ function App() {
 
   const handleConfigChange = (changedValues: any, allValues: AppConfig) => {
     let nextConfig = { ...config, ...allValues };
+    const profileFieldChanged = Object.keys(changedValues).some((key) =>
+      API_PROFILE_FIELD_KEYS.includes(key as typeof API_PROFILE_FIELD_KEYS[number]),
+    );
 
-    if (changedValues.activeApiProfileId && changedValues.activeApiProfileId !== config.activeApiProfileId) {
-      const selectedProfile = nextConfig.apiProfiles?.find(p => p.id === changedValues.activeApiProfileId);
-      if (selectedProfile) {
-        const { id, name, ...profileFields } = selectedProfile;
-        nextConfig = { ...nextConfig, ...profileFields };
-        form.setFieldsValue(profileFields);
-        changedValues.apiFormat = selectedProfile.apiFormat; // Trigger format config load if format differs
-      }
-    } else if (!changedValues.apiProfiles) {
-      // Normal field change, sync to active profile
-      const profileKeys = ['apiUrl', 'apiKey', 'model', 'apiFormat', 'apiVersion', 'vertexProjectId', 'vertexLocation', 'vertexPublisher', 'thinkingBudget', 'includeThoughts', 'includeImageConfig', 'includeSafetySettings', 'safety', 'imageConfig', 'webpQuality', 'useResponseModalities', 'customJson'];
-      const isProfileFieldChanged = Object.keys(changedValues).some(k => profileKeys.includes(k));
-      if (isProfileFieldChanged && nextConfig.apiProfiles) {
-        nextConfig.apiProfiles = nextConfig.apiProfiles.map(p => 
-          p.id === nextConfig.activeApiProfileId 
-            ? { ...p, ...profileKeys.reduce((acc, key) => ({ ...acc, [key]: (nextConfig as any)[key] }), {}) }
-            : p
-        );
-      }
+    if (profileFieldChanged && nextConfig.apiProfiles) {
+      nextConfig.apiProfiles = nextConfig.apiProfiles.map((profile) =>
+        profile.id === nextConfig.activeApiProfileId
+          ? { ...profile, ...pickApiProfileFields(nextConfig) }
+          : profile,
+      );
+      setApiConfigDirty(true);
     }
 
-    const nextFormat = nextConfig.apiFormat || config.apiFormat;
+    const nextFormat = coerceApiFormat(nextConfig.apiFormat || config.apiFormat);
     nextConfig.apiFormat = nextFormat;
 
     const formatChanged =
       typeof changedValues?.apiFormat === 'string' &&
       changedValues.apiFormat !== config.apiFormat;
 
-    if (backendMode) {
+    if (backendMode && !profileFieldChanged) {
       markConfigDirty();
     }
 
-    if (formatChanged && !changedValues.activeApiProfileId) {
+    if (formatChanged) {
       const formatConfig = backendMode
         ? getBackendFormatConfig(nextFormat)
         : loadFormatConfig(nextFormat);
       nextConfig = { ...nextConfig, ...formatConfig, apiFormat: nextFormat };
+      if (nextConfig.apiProfiles) {
+        nextConfig.apiProfiles = nextConfig.apiProfiles.map((profile) =>
+          profile.id === nextConfig.activeApiProfileId
+            ? { ...profile, ...pickApiProfileFields(nextConfig) }
+            : profile,
+        );
+      }
       form.setFieldsValue({
         apiUrl: formatConfig.apiUrl,
         apiKey: formatConfig.apiKey,
         model: formatConfig.model,
+        openaiEndpointMode: formatConfig.openaiEndpointMode,
         apiVersion: formatConfig.apiVersion,
         vertexProjectId: formatConfig.vertexProjectId,
         vertexLocation: formatConfig.vertexLocation,
@@ -886,6 +961,14 @@ function App() {
       }
     }
 
+    if (profileFieldChanged && nextConfig.apiProfiles) {
+      nextConfig.apiProfiles = nextConfig.apiProfiles.map((profile) =>
+        profile.id === nextConfig.activeApiProfileId
+          ? { ...profile, ...pickApiProfileFields(nextConfig) }
+          : profile,
+      );
+    }
+
     if (backendMode) {
       backendFormatConfigsRef.current = {
         ...backendFormatConfigsRef.current,
@@ -894,6 +977,99 @@ function App() {
     }
 
     setConfig(nextConfig);
+  };
+
+  const handleApiProfileChange = (profileId: string) => {
+    if (profileId === config.activeApiProfileId) return;
+    if (
+      apiConfigDirtyRef.current &&
+      !window.confirm('当前 API 配置档有未保存修改，切换后会丢弃这些修改。确定切换吗？')
+    ) {
+      form.setFieldsValue({ activeApiProfileId: config.activeApiProfileId });
+      return;
+    }
+
+    const savedConfig = persistedConfigRef.current;
+    const savedProfiles = savedConfig.apiProfiles || config.apiProfiles || [];
+    const selectedProfile = savedProfiles.find((profile) => profile.id === profileId);
+    let nextConfig: AppConfig = {
+      ...config,
+      apiProfiles: savedProfiles,
+      activeApiProfileId: profileId,
+    };
+    if (selectedProfile) {
+      const profileFields = pickApiProfileFields(selectedProfile as unknown as AppConfig);
+      nextConfig = {
+        ...nextConfig,
+        ...profileFields,
+        apiFormat: coerceApiFormat(profileFields.apiFormat),
+      };
+      form.setFieldsValue({ ...profileFields, activeApiProfileId: profileId });
+    } else {
+      form.setFieldsValue({ activeApiProfileId: profileId });
+    }
+
+    setModels([]);
+    setApiConfigDirty(false);
+    clearConfigDirty();
+    setConfig(nextConfig);
+  };
+
+  const handleSaveApiProfile = async () => {
+    const formValues = form.getFieldsValue(true) as AppConfig;
+    let nextConfig: AppConfig = {
+      ...config,
+      ...formValues,
+      apiFormat: coerceApiFormat(formValues.apiFormat || config.apiFormat),
+    };
+    const activeProfileId = nextConfig.activeApiProfileId || 'default';
+    const profiles =
+      nextConfig.apiProfiles && nextConfig.apiProfiles.length > 0
+        ? nextConfig.apiProfiles
+        : [
+            {
+              id: activeProfileId,
+              name: '默认配置',
+              ...pickApiProfileFields(nextConfig),
+            },
+          ];
+    nextConfig = {
+      ...nextConfig,
+      activeApiProfileId: activeProfileId,
+      apiProfiles: profiles.map((profile) =>
+        profile.id === activeProfileId
+          ? { ...profile, ...pickApiProfileFields(nextConfig) }
+          : profile,
+      ),
+    };
+    const nextFormatConfigs: FormatConfigMap = {
+      ...backendFormatConfigsRef.current,
+      [nextConfig.apiFormat]: buildFormatConfig(nextConfig),
+    };
+    backendFormatConfigsRef.current = nextFormatConfigs;
+    persistedConfigRef.current = nextConfig;
+    setConfig(nextConfig);
+    setApiConfigDirty(false);
+    clearConfigDirty();
+
+    try {
+      if (backendMode && backendReadyRef.current) {
+        const synced = await patchBackendState({
+          config: nextConfig,
+          configByFormat: nextFormatConfigs,
+        });
+        markConfigSynced({
+          config: synced.config,
+          configByFormat: buildBackendFormatConfigs(synced.configByFormat, synced.config),
+        });
+      } else {
+        saveConfig(nextConfig);
+      }
+      message.success('当前 API 配置档已保存');
+    } catch (err) {
+      console.error(err);
+      message.error('API 配置档保存失败');
+    }
   };
 
   const normalizePrompt = (prompt: string) =>
@@ -1352,11 +1528,14 @@ function App() {
           backendMode={backendMode}
           backendAuthPending={backendAuthPending}
           backendPassword={backendPassword}
+          apiConfigDirty={apiConfigDirty}
           onBackendPasswordChange={setBackendPassword}
           onBackendEnable={handleBackendEnable}
           onBackendDisable={handleBackendDisable}
           onBackendAuthCancel={handleBackendAuthCancel}
           onBackendAuthConfirm={handleBackendAuthConfirm}
+          onSaveApiProfile={() => void handleSaveApiProfile()}
+          onApiProfileChange={handleApiProfileChange}
         />
 
       </Layout>
