@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { useState, useCallback, useRef } from 'react';
-import { Layout, Button, Form, Row, Col, Typography, Space, ConfigProvider, message, Tooltip } from 'antd';
+import { Layout, Button, Form, Row, Col, Typography, Space, ConfigProvider, message, Tooltip, Segmented } from 'antd';
 import { 
   PlusOutlined, 
   SettingFilled, 
@@ -8,6 +8,7 @@ import {
   CheckCircleFilled, 
   HeartFilled,
   AppstoreFilled,
+  BranchesOutlined,
   DeleteFilled,
   RocketFilled,
   HourglassFilled,
@@ -19,6 +20,7 @@ import PromptDrawer from './components/PromptDrawer';
 import CollectionBox from './components/CollectionBox';
 import TaskGrid from './components/TaskGrid';
 import ConfigDrawer from './components/ConfigDrawer';
+import WorkflowBoard from './components/WorkflowBoard';
 import type { AppConfig, TaskConfig } from './types/app';
 import type { CollectionItem } from './types/collection';
 import type { GlobalStats } from './types/stats';
@@ -27,6 +29,7 @@ import {
   cleanupTaskCache,
   cleanupUnusedImageCache,
   collectTaskImageKeys,
+  collectWorkflowProjectImageKeys,
   deleteImageCache,
   type FormatConfig,
   buildFormatConfig,
@@ -52,8 +55,8 @@ import {
 } from './utils/apiUrl';
 import {
   API_FORMATS,
+  buildGoogleModelsRequest,
   coerceApiFormat,
-  getApiVersionFallback,
 } from './utils/providerRequests.mjs';
 import { safeStorageSet } from './utils/storage';
 import { calculateSuccessRate, formatDuration } from './utils/stats';
@@ -93,16 +96,20 @@ const API_PROFILE_FIELD_KEYS = [
   'apiFormat',
   'openaiEndpointMode',
   'apiVersion',
+  'vertexAuthMode',
   'vertexProjectId',
   'vertexLocation',
+  'vertexDefaultLocation',
+  'vertexModelLocations',
   'vertexPublisher',
   'thinkingBudget',
   'includeThoughts',
   'includeImageConfig',
-  'includeSafetySettings',
-  'safety',
-  'imageConfig',
-  'webpQuality',
+	  'includeSafetySettings',
+	  'safety',
+	  'imageConfig',
+	  'novelAiConfig',
+	  'webpQuality',
   'useResponseModalities',
   'customJson',
 ] as const;
@@ -146,6 +153,9 @@ function App() {
   const [tasks, setTasks] = useState<TaskConfig[]>(() =>
     initialBackendMode ? [] : loadTasks(),
   );
+  const [workspaceMode, setWorkspaceMode] = useState<'tasks' | 'workflow'>('tasks');
+  const [workflowOpenProjectIds, setWorkflowOpenProjectIds] = useState<string[]>([]);
+  const [workflowActiveProjectId, setWorkflowActiveProjectId] = useState<string | null>(null);
   const [globalStats, setGlobalStats] = useState<GlobalStats>(() => loadGlobalStats());
   const [configVisible, setConfigVisible] = useState(false);
   const [collectionVisible, setCollectionVisible] = useState(false);
@@ -181,6 +191,7 @@ function App() {
   const collectedItemsRef = useRef(collectedItems);
   const collectionCountRef = useRef(collectedItems.length);
   const configGuard = useInputGuard({ idleMs: 700 });
+
   const backendConfigPayload =
     backendMode && backendReadyRef.current && !apiConfigDirty
       ? { config, configByFormat: backendFormatConfigsRef.current }
@@ -484,7 +495,10 @@ function App() {
     if (config.enableCollection) return;
     if (backendMode) return;
     if (localHydratingRef.current) return;
-    const keepKeys = collectTaskImageKeys(tasks.map((task) => task.id));
+    const keepKeys = [
+      ...collectTaskImageKeys(tasks.map((task) => task.id)),
+      ...collectWorkflowProjectImageKeys(),
+    ];
     void cleanupUnusedImageCache(keepKeys);
   }, [config.enableCollection, tasks, backendMode]);
 
@@ -610,118 +624,69 @@ function App() {
     setLoadingModels(true);
     try {
       const apiFormat = coerceApiFormat(currentConfig.apiFormat || 'openai');
-      if (apiFormat === 'novelai') {
-        message.warning('NovelAI 模型列表暂不支持自动获取');
-        return;
-      }
-      if (apiFormat === 'vertex') {
-        message.warning('Vertex 标准模式模型列表暂不支持自动获取');
-        return;
-      }
-      const apiUrl = resolveApiUrl(currentConfig.apiUrl, apiFormat);
-      const versionFallback = getApiVersionFallback(apiFormat);
-      const version = resolveApiVersion(
-        apiUrl,
-        currentConfig.apiVersion,
-        versionFallback,
-      );
-      const baseInfo = normalizeApiBase(apiUrl);
-      const basePath = baseInfo.origin
-        ? `${baseInfo.origin}${baseInfo.segments.length ? `/${baseInfo.segments.join('/')}` : ''}`
-        : apiUrl.replace(/\/+$/, '');
-
-      let url = '';
-      const headers: Record<string, string> = {};
-
-      if (apiFormat === 'openai') {
-        const hasVersion = Boolean(inferApiVersionFromUrl(apiUrl));
-        const openAiBase = hasVersion ? basePath : `${basePath}/${version}`;
-        url = openAiBase.endsWith('/models') ? openAiBase : `${openAiBase}/models`;
-        headers.Authorization = `Bearer ${currentConfig.apiKey}`;
-      } else if (apiFormat === 'gemini' || apiFormat === 'vertex-express') {
-        const segments = [...baseInfo.segments];
-        if (!inferApiVersionFromUrl(apiUrl)) {
-          const markerIndex = segments.findIndex((segment) =>
-            ['publishers', 'models'].includes(segment),
-          );
-          if (markerIndex >= 0) segments.splice(markerIndex, 0, version);
-          else segments.push(version);
-        }
-        if (apiFormat === 'vertex-express') {
-          const publisherIndex = segments.indexOf('publishers');
-          if (publisherIndex >= 0) {
-            segments.splice(publisherIndex + 1);
-            segments.push(currentConfig.vertexPublisher || 'google', 'models');
-          } else {
-            segments.push('publishers', currentConfig.vertexPublisher || 'google', 'models');
-          }
-        } else {
-          const modelIndex = segments.indexOf('models');
-          if (modelIndex >= 0) {
-            segments.splice(modelIndex + 1);
-          } else {
-            segments.push('models');
-          }
-        }
-        const modelBase = baseInfo.origin
-          ? `${baseInfo.origin}/${segments.join('/')}`
-          : `${segments.join('/')}`;
-        const isOfficial =
-          apiFormat === 'gemini'
-            ? baseInfo.host === 'generativelanguage.googleapis.com'
-            : baseInfo.host === 'aiplatform.googleapis.com';
-        if (isOfficial) {
-          url = `${modelBase}?key=${encodeURIComponent(currentConfig.apiKey)}`;
-        } else {
-          url = modelBase;
-          headers.Authorization = `Bearer ${currentConfig.apiKey}`;
-        }
-      } else {
-        message.warning('当前 API 格式暂不支持自动获取模型列表');
-        return;
-      }
-
-      const res = await fetch(url, { headers });
-      
-      if (!res.ok) {
-        throw new Error(`HTTP error! status: ${res.status}`);
-      }
-
-      const data = await res.json();
-      if (apiFormat === 'openai') {
-        const list = Array.isArray(data.data) ? data.data : Array.isArray(data.models) ? data.models : [];
-        if (list.length === 0) {
-          throw new Error('返回数据格式不正确');
-        }
-        const modelOptions = list
-          .map((m: any) => ({ label: m.id || m.name, value: m.id || m.name }))
-          .filter((item: any) => typeof item.value === 'string')
-          .sort((a: any, b: any) => a.value.localeCompare(b.value));
-        setModels(modelOptions);
-        message.success(`成功获取 ${modelOptions.length} 个模型`);
-      } else {
-        const list = Array.isArray(data.models)
-          ? data.models
-          : Array.isArray(data.data)
-            ? data.data
-            : [];
-        if (list.length === 0) {
-          throw new Error('返回数据格式不正确');
-        }
-        const modelOptions = list
-          .map((m: any) => {
-            const rawName =
-              typeof m?.name === 'string' ? m.name : typeof m?.id === 'string' ? m.id : '';
-            const name = rawName
-              .replace(/^models\//, '')
-              .replace(/^publishers\/[^/]+\/models\//, '');
-            return name ? { label: name, value: name } : null;
-          })
-          .filter((item: any) => item && item.value)
-          .sort((a: any, b: any) => a.value.localeCompare(b.value));
-        setModels(modelOptions);
-        message.success(`成功获取 ${modelOptions.length} 个模型`);
-      }
+	      if (apiFormat === 'novelai') {
+	        message.warning('NovelAI 模型列表暂不支持自动获取');
+	        return;
+	      }
+	      if (apiFormat === 'openai') {
+	        const apiUrl = resolveApiUrl(currentConfig.apiUrl, apiFormat);
+	        const version = resolveApiVersion(apiUrl, currentConfig.apiVersion, 'v1');
+	        const baseInfo = normalizeApiBase(apiUrl);
+	        const basePath = baseInfo.origin
+	          ? `${baseInfo.origin}${baseInfo.segments.length ? `/${baseInfo.segments.join('/')}` : ''}`
+	          : apiUrl.replace(/\/+$/, '');
+	        const hasVersion = Boolean(inferApiVersionFromUrl(apiUrl));
+	        const openAiBase = hasVersion ? basePath : `${basePath}/${version}`;
+	        const url = openAiBase.endsWith('/models') ? openAiBase : `${openAiBase}/models`;
+	        const res = await fetch(url, { headers: { Authorization: `Bearer ${currentConfig.apiKey}` } });
+	        if (!res.ok) {
+	          throw new Error(`HTTP error! status: ${res.status}`);
+	        }
+	        const data = await res.json();
+	        const list = Array.isArray(data.data) ? data.data : Array.isArray(data.models) ? data.models : [];
+	        if (list.length === 0) {
+	          throw new Error('返回数据格式不正确');
+	        }
+	        const modelOptions = list
+	          .map((m: any) => ({ label: m.id || m.name, value: m.id || m.name }))
+	          .filter((item: any) => typeof item.value === 'string')
+	          .sort((a: any, b: any) => a.value.localeCompare(b.value));
+	        setModels(modelOptions);
+	        message.success(`成功获取 ${modelOptions.length} 个模型`);
+	        return;
+	      } else if (apiFormat === 'gemini' || apiFormat === 'vertex') {
+	        const { url, headers } = await buildGoogleModelsRequest({ ...currentConfig, apiFormat });
+	        const res = await fetch(url, { headers });
+	        if (!res.ok) {
+	          throw new Error(`HTTP error! status: ${res.status}`);
+	        }
+	        const data = await res.json();
+	        const list = Array.isArray(data.models)
+	          ? data.models
+	          : Array.isArray(data.data)
+	            ? data.data
+	            : [];
+	        if (list.length === 0) {
+	          throw new Error('返回数据格式不正确');
+	        }
+	        const modelOptions = list
+	          .map((m: any) => {
+	            const rawName =
+	              typeof m?.name === 'string' ? m.name : typeof m?.id === 'string' ? m.id : '';
+	            const name = rawName
+	              .replace(/^models\//, '')
+	              .replace(/^publishers\/[^/]+\/models\//, '');
+	            return name ? { label: name, value: name } : null;
+	          })
+	          .filter((item: any) => item && item.value)
+	          .sort((a: any, b: any) => a.value.localeCompare(b.value));
+	        setModels(modelOptions);
+	        message.success(`成功获取 ${modelOptions.length} 个模型`);
+	        return;
+	      } else {
+	        message.warning('当前 API 格式暂不支持自动获取模型列表');
+	        return;
+	      }
     } catch (e) {
       console.error(e);
       message.error('获取模型列表失败，请检查配置');
@@ -737,8 +702,8 @@ function App() {
     }
   }, [configVisible]);
 
-  const handleAddTask = () => {
-    const newTaskId = uuidv4();
+	  const handleAddTask = () => {
+	    const newTaskId = uuidv4();
     if (backendMode) {
       void putBackendTask(newTaskId, {
         version: TASK_STATE_VERSION,
@@ -754,9 +719,9 @@ function App() {
         console.error(err);
         message.error('创建后端任务失败');
       });
-    }
-    setTasks([...tasks, { id: newTaskId, prompt: '' }]);
-  };
+		    }
+		    setTasks([...tasks, { id: newTaskId, prompt: '' }]);
+		  };
 
   const handleReorderTasks = useCallback((nextTasks: TaskConfig[]) => {
     setTasks(nextTasks);
@@ -797,8 +762,8 @@ function App() {
       });
     }
 
-    setTasks([...tasks, { id: newTaskId, prompt }]);
-  };
+		    setTasks([...tasks, { id: newTaskId, prompt }]);
+		  };
 
   const handleCreateTaskFromCollection = (prompt: string, referenceImages: CollectionItem[]) => {
     const newTaskId = uuidv4();
@@ -848,8 +813,8 @@ function App() {
       });
     }
 
-    setTasks([...tasks, { id: newTaskId, prompt }]);
-    setCollectionVisible(false);
+		    setTasks([...tasks, { id: newTaskId, prompt }]);
+		    setCollectionVisible(false);
     message.success('已创建新任务');
   };
 
@@ -866,25 +831,29 @@ function App() {
       });
     } else {
       const storageKey = getTaskStorageKey(id);
-      const preserveKeys = config.enableCollection
-        ? collectedItems
-            .filter(
-              (item) =>
-                item.taskId === id &&
-                typeof item.localKey === 'string' &&
-                !isCollectionCacheKey(item.localKey) &&
-                !isBackendImageKey(item.localKey),
-            )
-            .map((item) => item.localKey as string)
-        : [];
+      const preserveKeys = [
+        ...(config.enableCollection
+          ? collectedItems
+              .filter(
+                (item) =>
+                  item.taskId === id &&
+                  typeof item.localKey === 'string' &&
+                  !isCollectionCacheKey(item.localKey) &&
+                  !isBackendImageKey(item.localKey),
+              )
+              .map((item) => item.localKey as string)
+          : []),
+        ...collectWorkflowProjectImageKeys(),
+      ];
       if (preserveKeys.length > 0) {
         void cleanupTaskCache(storageKey, { preserveImageKeys: preserveKeys });
       } else {
         void cleanupTaskCache(storageKey);
       }
-    }
-    setTasks(tasks.filter((t: TaskConfig) => t.id !== id));
-  };
+	    }
+		    const nextTasks = tasks.filter((t: TaskConfig) => t.id !== id);
+		    setTasks(nextTasks);
+		  };
 
   const handleConfigChange = (changedValues: any, allValues: AppConfig) => {
     let nextConfig = { ...config, ...allValues };
@@ -928,17 +897,21 @@ function App() {
         apiUrl: formatConfig.apiUrl,
         apiKey: formatConfig.apiKey,
         model: formatConfig.model,
-        openaiEndpointMode: formatConfig.openaiEndpointMode,
-        apiVersion: formatConfig.apiVersion,
-        vertexProjectId: formatConfig.vertexProjectId,
-        vertexLocation: formatConfig.vertexLocation,
-        vertexPublisher: formatConfig.vertexPublisher,
+	        openaiEndpointMode: formatConfig.openaiEndpointMode,
+	        apiVersion: formatConfig.apiVersion,
+	        vertexAuthMode: formatConfig.vertexAuthMode,
+	        vertexProjectId: formatConfig.vertexProjectId,
+	        vertexLocation: formatConfig.vertexLocation,
+	        vertexDefaultLocation: formatConfig.vertexDefaultLocation,
+	        vertexModelLocations: formatConfig.vertexModelLocations,
+	        vertexPublisher: formatConfig.vertexPublisher,
         thinkingBudget: formatConfig.thinkingBudget,
         includeThoughts: formatConfig.includeThoughts,
         includeImageConfig: formatConfig.includeImageConfig,
         includeSafetySettings: formatConfig.includeSafetySettings,
         safety: formatConfig.safety,
         imageConfig: formatConfig.imageConfig,
+        novelAiConfig: formatConfig.novelAiConfig,
         webpQuality: formatConfig.webpQuality,
         useResponseModalities: formatConfig.useResponseModalities,
         customJson: formatConfig.customJson,
@@ -1286,9 +1259,34 @@ function App() {
             </div>
           </div>
 
-          <Space size={8} className="header-actions">
-            <Tooltip title="提示词广场">
-              <Button
+	          <Space size={8} className="header-actions">
+	            <Segmented
+	              className="workspace-mode-switch"
+	              value={workspaceMode}
+	              onChange={(value) => setWorkspaceMode(value as 'tasks' | 'workflow')}
+	              options={[
+	                {
+	                  value: 'tasks',
+	                  label: (
+	                    <span className="workspace-mode-label">
+	                      <AppstoreFilled />
+	                      任务卡
+	                    </span>
+	                  ),
+	                },
+	                {
+	                  value: 'workflow',
+	                  label: (
+	                    <span className="workspace-mode-label">
+	                      <BranchesOutlined />
+	                      工作流
+	                    </span>
+	                  ),
+	                },
+	              ]}
+	            />
+	            <Tooltip title="提示词广场">
+	              <Button
                 icon={<AppstoreFilled />}
                 onClick={() => setPromptDrawerVisible(true)}
                 size="large"
@@ -1340,11 +1338,30 @@ function App() {
             </Button>
           </Space>
         </Header>
-        
-        <Content style={{ padding: '24px', maxWidth: 1400, margin: '0 auto', width: '100%' }}>
-          
-          {/* 数据仪表盘 - 重新设计 */}
-          <div className="fade-in-up" style={{ marginBottom: 32 }}>
+
+	        <Content
+	          style={
+	            workspaceMode === 'workflow'
+	              ? { padding: 0, width: '100%', minHeight: 'calc(100vh - 72px)' }
+	              : { padding: '24px', maxWidth: 1400, margin: '0 auto', width: '100%' }
+	          }
+	        >
+	          {workspaceMode === 'workflow' ? (
+		            <WorkflowBoard
+		              tasks={tasks}
+			              config={config}
+			              backendMode={backendMode}
+			              openProjectIds={workflowOpenProjectIds}
+			              activeProjectId={workflowActiveProjectId}
+			              onOpenProjectIdsChange={setWorkflowOpenProjectIds}
+			              onActiveProjectIdChange={setWorkflowActiveProjectId}
+			              onCreateTask={handleAddTask}
+	              onStatsUpdate={updateGlobalStats}
+	            />
+	          ) : (
+	          <>
+	          {/* 数据仪表盘 - 重新设计 */}
+	          <div className="fade-in-up" style={{ marginBottom: 32 }}>
             <div
               style={{
                 display: 'flex',
@@ -1484,10 +1501,12 @@ function App() {
             collectionRevision={collectionRevision}
             onRemoveTask={handleRemoveTask}
             onStatsUpdate={updateGlobalStats}
-            onCollect={handleCollect}
-            onReorder={handleReorderTasks}
-          />
-        </Content>
+	            onCollect={handleCollect}
+	            onReorder={handleReorderTasks}
+	          />
+	          </>
+	          )}
+	        </Content>
 
         <PromptDrawer 
           visible={promptDrawerVisible}

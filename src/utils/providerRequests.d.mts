@@ -1,6 +1,6 @@
 import type { AppConfig } from '../types/app';
 
-export type ApiFormat = 'openai' | 'gemini' | 'vertex' | 'vertex-express' | 'novelai';
+export type ApiFormat = 'openai' | 'gemini' | 'vertex' | 'novelai';
 
 export const API_FORMATS: ApiFormat[];
 export const GOOGLE_API_FORMATS: ApiFormat[];
@@ -9,7 +9,7 @@ export const DEFAULT_API_BASES: Record<ApiFormat, string>;
 
 export function isSupportedApiFormat(value: unknown): value is ApiFormat;
 export function coerceApiFormat(value: unknown): ApiFormat;
-export function isGoogleApiFormat(value: unknown): value is 'gemini' | 'vertex' | 'vertex-express';
+export function isGoogleApiFormat(value: unknown): value is 'gemini' | 'vertex';
 export function isVersionSegment(value?: unknown): boolean;
 export function resolveApiUrl(apiUrl: string | undefined, apiFormat: ApiFormat): string;
 export function normalizeApiBase(apiUrl?: string): {
@@ -25,11 +25,17 @@ export function resolveApiVersion(
 ): string;
 export function extractVertexProjectId(apiUrl?: string): string | null;
 export function getApiVersionFallback(apiFormat: ApiFormat): string;
+export function normalizeVertexModelName(model?: string): string;
+export function resolveVertexLocation(config?: Partial<AppConfig>, model?: string): string;
+export function getGoogleAccessToken(serviceAccountJson: string | Record<string, unknown>): Promise<string>;
 
 export function buildGoogleGenerateRequest(
   config: Partial<AppConfig>,
   options?: { stream?: boolean },
-): { url: string; headers: Record<string, string> };
+): Promise<{ url: string; headers: Record<string, string> }>;
+export function buildGoogleModelsRequest(
+  config: Partial<AppConfig>,
+): Promise<{ url: string; headers: Record<string, string> }>;
 
 export function buildGeminiGenerationConfig(config?: Partial<AppConfig>): Record<string, unknown> | null;
 export function buildGeminiSafetySettings(config?: Partial<AppConfig>): Array<Record<string, string>> | null;
@@ -46,10 +52,7 @@ export function buildOpenAiBaseUrl(apiUrl: string, apiVersion?: string): string;
 export function buildOpenAiChatUrl(openAiBase: string): string;
 export function buildOpenAiImagesUrl(openAiBase: string, hasReferenceImages: boolean): string;
 
-export function getNovelAiDimensions(imageConfig?: Partial<AppConfig['imageConfig']>): {
-  width: number;
-  height: number;
-};
+export function splitNovelAiPrompt(prompt?: string): { input: string; uc: string };
 export function buildNovelAiRequest(
   config: Partial<AppConfig>,
   options?: { prompt?: string },

@@ -56,5 +56,7 @@ export const serializeResults = (results: SubTaskResult[]): PersistedSubTaskResu
       localKey: result.localKey,
       sourceUrl: shouldStoreSource ? sourceUrl : undefined,
       savedLocal: result.savedLocal,
+      workflowProjectId: result.workflowProjectId,
+      workflowNodeId: result.workflowNodeId,
     };
   });

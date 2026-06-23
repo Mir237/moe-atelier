@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   Input, Button, Upload, message, Spin, Image, 
-  Space, Typography, Tooltip, Popover, InputNumber, Select
+  Space, Typography, Tooltip, Popover, InputNumber, Select, Modal
 } from 'antd';
 import type { TextAreaRef } from 'antd/es/input/TextArea';
 import { 
@@ -13,12 +13,13 @@ import {
   PlayCircleFilled,
   HolderOutlined,
   CloudUploadOutlined,
-  SettingFilled
+  SettingFilled,
+  SlidersOutlined
 } from '@ant-design/icons';
 import type { RcFile, UploadFile } from 'antd/es/upload/interface';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
-import type { AppConfig } from '../types/app';
+import type { AppConfig, NovelAiOverrides } from '../types/app';
 import type { TaskStats } from '../types/stats';
 import type {
   PersistedImageTaskState,
@@ -62,6 +63,14 @@ import {
   formatUnknownErrorMessage,
 } from '../utils/httpError';
 import { useDebouncedSync, useInputGuard } from '../utils/inputSync';
+import UploadProgressOverlay from '../shared/ui/UploadProgressOverlay';
+import NovelAiParameterPanel from './NovelAiParameterPanel';
+import {
+  hasNovelAiOverrides,
+  isNovelAiProfile,
+  mergeNovelAiConfig,
+  stripEmptyNovelAiOverrides,
+} from '../utils/novelAiConfig';
 
 const { Text } = Typography;
 const { TextArea } = Input;
@@ -87,6 +96,8 @@ type UploadFileWithMeta = UploadFile & {
   lastModified?: number;
   fromCollection?: boolean;
   sourceSignature?: string;
+  workflowProjectId?: string;
+  workflowNodeId?: string;
 };
 
 type CollectionUploadSnapshot = {
@@ -109,8 +120,11 @@ type BackendTaskSyncPayload = {
   retryInterval: number;
   retryLimit: number;
   apiProfileId: string;
+  novelAiOverrides: NovelAiOverrides;
   uploads: PersistedUploadImage[];
 };
+
+type UploadProgressValue = number | null;
 
 const areSyncValuesEqual = (previous: unknown, next: unknown) =>
   JSON.stringify(previous) === JSON.stringify(next);
@@ -128,6 +142,7 @@ const buildBackendTaskPatch = (
     'retryInterval',
     'retryLimit',
     'apiProfileId',
+    'novelAiOverrides',
     'uploads',
   ];
   keys.forEach((key) => {
@@ -157,6 +172,8 @@ const normalizeStoredResult = (item: PersistedSubTaskResult, backendMode: boolea
     localKey: item.localKey,
     sourceUrl: item.sourceUrl,
     savedLocal: item.savedLocal,
+    workflowProjectId: item.workflowProjectId,
+    workflowNodeId: item.workflowNodeId,
     displayUrl: item.localKey ? undefined : item.sourceUrl,
   };
 };
@@ -173,6 +190,8 @@ const serializeUploads = (uploads: UploadFileWithMeta[]): PersistedUploadImage[]
       localKey: file.localKey as string,
       fromCollection: file.fromCollection,
       sourceSignature: file.sourceSignature,
+      workflowProjectId: file.workflowProjectId,
+      workflowNodeId: file.workflowNodeId,
     }));
 
 const normalizeUploadsPayload = (uploads: PersistedUploadImage[] = []) =>
@@ -185,6 +204,8 @@ const normalizeUploadsPayload = (uploads: PersistedUploadImage[] = []) =>
     localKey: item.localKey,
     fromCollection: item.fromCollection,
     sourceSignature: item.sourceSignature,
+    workflowProjectId: item.workflowProjectId,
+    workflowNodeId: item.workflowNodeId,
   }));
 
 const normalizeConcurrency = (value: unknown, fallback = DEFAULT_CONCURRENCY) => {
@@ -226,6 +247,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const promptTextareaRef = useRef<TextAreaRef | null>(null);
   const stickyNoteWrapRef = useRef<HTMLDivElement | null>(null);
   const [fileList, setFileList] = useState<UploadFileWithMeta[]>([]);
+  const [uploadProgressByUid, setUploadProgressByUid] = useState<Record<string, UploadProgressValue>>({});
   const fileListRef = useRef<UploadFileWithMeta[]>(fileList);
   const [concurrency, setConcurrency] = useState<number>(DEFAULT_CONCURRENCY);
   const [concurrencyInput, setConcurrencyInput] = useState<string>(String(DEFAULT_CONCURRENCY));
@@ -236,6 +258,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const retryLimitRef = useRef(retryLimit);
   const [apiProfileId, setApiProfileId] = useState<string>('default');
   const apiProfileIdRef = useRef(apiProfileId);
+  const [novelAiOverrides, setNovelAiOverrides] = useState<NovelAiOverrides>({});
+  const [novelAiModalOpen, setNovelAiModalOpen] = useState(false);
   
   const [results, setResults] = useState<SubTaskResult[]>([]);
   const [isGlobalLoading, setIsGlobalLoading] = useState(false);
@@ -254,6 +278,9 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const dbPromiseRef = useRef<Promise<IDBDatabase> | null>(null);
   const objectUrlMapRef = useRef<Map<string, string>>(new Map());
   const uploadKeysRef = useRef<Map<string, string>>(new Map());
+  const backendUploadUidsInFlightRef = useRef<Set<string>>(new Set());
+  const localUploadKeysInFlightRef = useRef<Set<string>>(new Set());
+  const activeUploadCountRef = useRef(0);
   const cachedUploadKeysRef = useRef<Set<string>>(new Set());
   const collectedCollectionKeysRef = useRef<Set<string>>(new Set());
   const requestContextByResultIdRef = useRef<Map<string, CollectionRequestSnapshot>>(new Map());
@@ -279,11 +306,12 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       concurrency,
       enableSound,
       retryInterval,
-      retryLimit,
-      apiProfileId,
-      uploads: normalizeUploadsPayload(serializeUploads(fileList)) as PersistedUploadImage[],
-    };
-  }, [backendMode, hydrated, prompt, concurrency, enableSound, retryInterval, retryLimit, apiProfileId, fileList]);
+	      retryLimit,
+	      apiProfileId,
+	      novelAiOverrides: stripEmptyNovelAiOverrides(novelAiOverrides),
+	      uploads: normalizeUploadsPayload(serializeUploads(fileList)) as PersistedUploadImage[],
+	    };
+	  }, [backendMode, hydrated, prompt, concurrency, enableSound, retryInterval, retryLimit, apiProfileId, novelAiOverrides, fileList]);
   const taskSync = useDebouncedSync({
     enabled: backendMode && hydrated,
     payload: backendPayload,
@@ -316,6 +344,66 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     shouldPreserve: shouldPreserveApiProfileInput,
   } = apiProfileGuard;
   const { markSynced: markTaskSynced } = taskSync;
+  const uploadMessageKey = `task-image-upload-${id}`;
+  const isUploadingImages = Object.keys(uploadProgressByUid).length > 0;
+
+  const showUploadLoadingMessage = (count: number) => {
+    activeUploadCountRef.current += count;
+    const activeCount = activeUploadCountRef.current;
+    message.open({
+      key: uploadMessageKey,
+      type: 'loading',
+      content: activeCount > 1 ? `正在上传 ${activeCount} 张图片` : '正在上传图片',
+      duration: 0,
+    });
+  };
+
+  const finishUploadMessage = (completed: number, failed: number) => {
+    activeUploadCountRef.current = Math.max(
+      0,
+      activeUploadCountRef.current - completed - failed,
+    );
+    if (activeUploadCountRef.current > 0) {
+      const activeCount = activeUploadCountRef.current;
+      message.open({
+        key: uploadMessageKey,
+        type: 'loading',
+        content: activeCount > 1 ? `正在上传 ${activeCount} 张图片` : '正在上传图片',
+        duration: 0,
+      });
+      return;
+    }
+    if (failed > 0 && completed === 0) {
+      message.open({
+        key: uploadMessageKey,
+        type: 'error',
+        content: '图片上传失败',
+        duration: 3,
+      });
+      return;
+    }
+    if (completed > 0) {
+      message.open({
+        key: uploadMessageKey,
+        type: 'success',
+        content: failed > 0 ? '部分图片上传完成' : '图片上传完成',
+        duration: 2,
+      });
+    }
+  };
+
+  const setUploadProgress = (uid: string, percent: UploadProgressValue) => {
+    setUploadProgressByUid((prev) => ({ ...prev, [uid]: percent }));
+  };
+
+  const clearUploadProgress = (uid: string) => {
+    setUploadProgressByUid((prev) => {
+      if (!(uid in prev)) return prev;
+      const next = { ...prev };
+      delete next[uid];
+      return next;
+    });
+  };
 
   const resolveTaskApiProfileId = (value?: string) => {
     const availableProfiles = config.apiProfiles || [{ id: 'default', name: '默认配置' }];
@@ -431,10 +519,11 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       shouldPreservePromptInput(nextPrompt, currentPrompt);
     const nextConcurrency = normalizeConcurrency(stored.concurrency, DEFAULT_CONCURRENCY);
     const nextEnableSound = typeof stored.enableSound === 'boolean' ? stored.enableSound : true;
-    const nextRetryInterval = typeof stored.retryInterval === 'number' ? stored.retryInterval : 1000;
-    const nextRetryLimit = typeof stored.retryLimit === 'number' ? stored.retryLimit : -1;
-    const shouldPreserveRetryInterval =
-      shouldPreserveRetryIntervalInput(nextRetryInterval, currentRetryInterval);
+	    const nextRetryInterval = typeof stored.retryInterval === 'number' ? stored.retryInterval : 1000;
+	    const nextRetryLimit = typeof stored.retryLimit === 'number' ? stored.retryLimit : -1;
+	    const nextNovelAiOverrides = stripEmptyNovelAiOverrides(stored.novelAiOverrides);
+	    const shouldPreserveRetryInterval =
+	      shouldPreserveRetryIntervalInput(nextRetryInterval, currentRetryInterval);
     const shouldPreserveRetryLimit =
       shouldPreserveRetryLimitInput(nextRetryLimit, currentRetryLimit);
     const nextApiProfileId = resolveTaskApiProfileId(stored.apiProfileId);
@@ -445,11 +534,12 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       prompt: nextPrompt,
       concurrency: nextConcurrency,
       enableSound: nextEnableSound,
-      retryInterval: nextRetryInterval,
-      retryLimit: nextRetryLimit,
-      apiProfileId: nextApiProfileId,
-      uploads: normalizeUploadsPayload(storedUploads) as PersistedUploadImage[],
-    };
+	      retryInterval: nextRetryInterval,
+	      retryLimit: nextRetryLimit,
+	      apiProfileId: nextApiProfileId,
+	      novelAiOverrides: nextNovelAiOverrides,
+	      uploads: normalizeUploadsPayload(storedUploads) as PersistedUploadImage[],
+	    };
     backendSyncedTaskPayloadRef.current = syncedTaskPayload;
     markTaskSynced(syncedTaskPayload);
 
@@ -468,9 +558,10 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     } else if (nextPrompt === currentPrompt) {
       clearPromptDirty();
     }
-    setConcurrency(nextConcurrency);
-    setConcurrencyInput(String(nextConcurrency));
-    setEnableSound(nextEnableSound);
+	    setConcurrency(nextConcurrency);
+	    setConcurrencyInput(String(nextConcurrency));
+	    setEnableSound(nextEnableSound);
+	    setNovelAiOverrides(nextNovelAiOverrides);
     if (!shouldPreserveRetryInterval) {
       retryIntervalRef.current = nextRetryInterval;
       clearRetryIntervalDirty();
@@ -584,10 +675,11 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         setConcurrency(nextConcurrency);
         setConcurrencyInput(String(nextConcurrency));
         setEnableSound(typeof stored.enableSound === 'boolean' ? stored.enableSound : true);
-        setRetryInterval(typeof stored.retryInterval === 'number' ? stored.retryInterval : 1000);
-        setRetryLimit(typeof stored.retryLimit === 'number' ? stored.retryLimit : -1);
-        setApiProfileId(resolveTaskApiProfileId(stored.apiProfileId));
-        setStats({ ...DEFAULT_TASK_STATS, ...(stored.stats || {}) });
+	        setRetryInterval(typeof stored.retryInterval === 'number' ? stored.retryInterval : 1000);
+	        setRetryLimit(typeof stored.retryLimit === 'number' ? stored.retryLimit : -1);
+	        setApiProfileId(resolveTaskApiProfileId(stored.apiProfileId));
+	        setNovelAiOverrides(stripEmptyNovelAiOverrides(stored.novelAiOverrides));
+	        setStats({ ...DEFAULT_TASK_STATS, ...(stored.stats || {}) });
         const storedResults = Array.isArray(stored.results) ? stored.results : [];
         const hydratedResults: SubTaskResult[] = [];
         for (const item of storedResults) {
@@ -646,6 +738,8 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
               localKey: item.localKey,
               fromCollection: item.fromCollection,
               sourceSignature: signature || item.sourceSignature,
+              workflowProjectId: item.workflowProjectId,
+              workflowNodeId: item.workflowNodeId,
             });
           }
           if (isActive) {
@@ -710,7 +804,9 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
   useEffect(() => {
     if (!hydrated || backendMode) return;
+    const existing = loadTaskState(storageKey);
     const payload: PersistedImageTaskState = {
+      ...(existing || {}),
       version: TASK_STATE_VERSION,
       prompt,
       concurrency,
@@ -718,12 +814,13 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
       retryInterval,
       retryLimit,
       results: serializeResults(results),
-      uploads: serializeUploads(fileList),
-      stats,
-      apiProfileId,
-    };
-    saveTaskState(storageKey, payload);
-  }, [prompt, concurrency, enableSound, retryInterval, retryLimit, results, stats, storageKey, hydrated, fileList, backendMode, apiProfileId]);
+	      uploads: serializeUploads(fileList),
+	      stats,
+	      apiProfileId,
+	      novelAiOverrides: stripEmptyNovelAiOverrides(novelAiOverrides),
+	    };
+	    saveTaskState(storageKey, payload);
+	  }, [prompt, concurrency, enableSound, retryInterval, retryLimit, results, stats, storageKey, hydrated, fileList, backendMode, apiProfileId, novelAiOverrides]);
 
   useEffect(() => {
     if (!backendMode) return;
@@ -791,21 +888,44 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     let isActive = true;
     const persistUploads = async () => {
       const pending = fileList.filter(
-        (file) => file.originFileObj && file.localKey && !cachedUploadKeysRef.current.has(file.localKey),
+        (file) =>
+          file.originFileObj &&
+          file.localKey &&
+          !cachedUploadKeysRef.current.has(file.localKey) &&
+          !localUploadKeysInFlightRef.current.has(file.localKey),
       );
       if (pending.length === 0) return;
-      try {
-        await Promise.all(
-          pending.map(async (file) => {
-            const localKey = file.localKey as string;
+      pending.forEach((file) => {
+        if (!file.localKey) return;
+        localUploadKeysInFlightRef.current.add(file.localKey);
+        setUploadProgress(file.uid, null);
+      });
+      showUploadLoadingMessage(pending.length);
+      let completed = 0;
+      let failed = 0;
+      await Promise.all(
+        pending.map(async (file) => {
+          const localKey = file.localKey as string;
+          try {
             await saveImageBlob(localKey, file.originFileObj as File);
-            cachedUploadKeysRef.current.add(localKey);
-          }),
-        );
-        if (!isActive) return;
-      } catch (err) {
-        console.warn('上传图片缓存失败:', err);
-      }
+            const stillPresent = fileListRef.current.some((item) => item.uid === file.uid);
+            if (stillPresent) {
+              cachedUploadKeysRef.current.add(localKey);
+              completed += 1;
+            } else {
+              void deleteImageBlob(localKey);
+              completed += 1;
+            }
+          } catch (err) {
+            failed += 1;
+            console.warn('上传图片缓存失败:', err);
+          } finally {
+            localUploadKeysInFlightRef.current.delete(localKey);
+            if (isActive) clearUploadProgress(file.uid);
+          }
+        }),
+      );
+      finishUploadMessage(completed, failed);
     };
     void persistUploads();
     return () => {
@@ -1528,9 +1648,21 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     retryCount: 0
   });
 
-  const getActiveProfile = () => {
-    return config.apiProfiles?.find(p => p.id === apiProfileId) || config;
-  };
+	  const getBaseActiveProfile = () => {
+	    return config.apiProfiles?.find(p => p.id === apiProfileId) || config;
+	  };
+
+	  const getActiveProfile = () => {
+	    const profile = getBaseActiveProfile();
+	    if (!isNovelAiProfile(profile)) return profile;
+	    return {
+	      ...profile,
+	      novelAiConfig: mergeNovelAiConfig(
+	        profile.novelAiConfig || config.novelAiConfig,
+	        novelAiOverrides,
+	      ),
+	    };
+	  };
 
   const handleGenerate = async () => {
     const profile = getActiveProfile();
@@ -1545,6 +1677,10 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     const hasImage = fileList.length > 0;
     if (!prompt && !hasImage) {
       message.warning('请输入提示词或上传参考图');
+      return;
+    }
+    if (isUploadingImages) {
+      message.warning('图片正在上传，请稍后再试');
       return;
     }
     if (backendMode) {
@@ -1792,7 +1928,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
         }
       } else if (isGoogleApiFormat(apiFormat)) {
         const contents = await buildGeminiContents(profile);
-        const { url, headers } = buildGoogleGenerateRequest(
+        const { url, headers } = await buildGoogleGenerateRequest(
           { ...profile, apiFormat },
           { stream: Boolean(config.stream) },
         );
@@ -2043,22 +2179,37 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 
     if (!backendMode) return;
     const pending = normalized.filter(
-      (file) => file.originFileObj && !file.localKey,
+      (file) =>
+        file.originFileObj &&
+        !file.localKey &&
+        !backendUploadUidsInFlightRef.current.has(file.uid),
     );
     if (pending.length === 0) return;
+    pending.forEach((file) => {
+      backendUploadUidsInFlightRef.current.add(file.uid);
+      setUploadProgress(file.uid, 0);
+    });
+    showUploadLoadingMessage(pending.length);
 
     void (async () => {
+      let completed = 0;
+      let failed = 0;
       for (const file of pending) {
         try {
           const { key } = await uploadBackendImage(file.originFileObj as File, {
             name: file.name,
             lastModified: file.lastModified ?? file.originFileObj?.lastModified,
+          }, {
+            onUploadProgress: (progress) => {
+              setUploadProgress(file.uid, progress.percent ?? null);
+            },
           });
           const stillPresent = fileListRef.current.some((item) => item.uid === file.uid);
           if (!stillPresent) {
             void cleanupBackendImages([key]).catch((err) => {
               console.warn('后端参考图清理失败:', err);
             });
+            completed += 1;
             continue;
           }
           setFileList((prev) =>
@@ -2072,11 +2223,17 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                 : item,
             ),
           );
+          completed += 1;
         } catch (err) {
+          failed += 1;
           console.error(err);
           message.error(`上传失败: ${file.name}`);
+        } finally {
+          backendUploadUidsInFlightRef.current.delete(file.uid);
+          clearUploadProgress(file.uid);
         }
       }
+      finishUploadMessage(completed, failed);
     })();
   };
 
@@ -2091,8 +2248,16 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   
   const fastestTimeStr = formatDuration(stats.fastestTime);
   const slowestTimeStr = formatDuration(stats.slowestTime);
-  const backendTaskWaiting = backendMode && !hydrated;
-  const promptPlaceholder = backendTaskWaiting
+		  const backendTaskWaiting = backendMode && !hydrated;
+		  const selectedBaseProfile = getBaseActiveProfile();
+		  const showNovelAiTaskPanel = isNovelAiProfile(selectedBaseProfile);
+		  const hasTaskNovelAiOverrides = hasNovelAiOverrides(novelAiOverrides);
+		  useEffect(() => {
+		    if (!showNovelAiTaskPanel && novelAiModalOpen) {
+		      setNovelAiModalOpen(false);
+		    }
+		  }, [showNovelAiTaskPanel, novelAiModalOpen]);
+		  const promptPlaceholder = backendTaskWaiting
     ? backendTaskLoadError
       ? '后端任务加载失败，正在重试...'
       : '正在从后端加载...'
@@ -2212,20 +2377,36 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                 transition: 'all 0.3s ease'
               }} 
             />
-            <Select
-              size="small"
-              value={apiProfileId}
+	            <Select
+	              size="small"
+	              value={apiProfileId}
               onChange={handleApiProfileChange}
               options={(config.apiProfiles || [{ id: 'default', name: '默认配置' }]).map(p => ({ label: p.name, value: p.id }))}
               style={{ minWidth: 80 }}
               variant="borderless"
               popupMatchSelectWidth={false}
               dropdownStyle={{ minWidth: 120, borderRadius: 8 }}
-              disabled={backendTaskWaiting}
-            />
-          </div>
-        </Space>
-        <Button 
+	              disabled={backendTaskWaiting}
+	            />
+	          </div>
+	          {showNovelAiTaskPanel ? (
+	            <Tooltip title="NovelAI 参数">
+	              <Button
+	                size="small"
+	                shape="circle"
+	                icon={<SlidersOutlined />}
+	                disabled={backendTaskWaiting}
+	                onClick={() => setNovelAiModalOpen(true)}
+	                style={{
+	                  color: hasTaskNovelAiOverrides ? '#FF7090' : '#998888',
+	                  background: hasTaskNovelAiOverrides ? '#FFF0F3' : '#fff',
+	                  border: `1px solid ${hasTaskNovelAiOverrides ? '#FFB7C5' : '#E8E8E8'}`,
+	                }}
+	              />
+	            </Tooltip>
+	          ) : null}
+	        </Space>
+	        <Button 
           type="text" 
           danger 
           icon={<DeleteFilled />} 
@@ -2233,9 +2414,29 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
           size="small"
           style={{ color: '#FFB7C5' }} 
         />
-      </div>
+	      </div>
 
-      {/* Stats Bar - 紧凑设计 */}
+	      <Modal
+	        title="NovelAI 参数"
+	        open={showNovelAiTaskPanel && novelAiModalOpen}
+	        footer={null}
+	        onCancel={() => setNovelAiModalOpen(false)}
+	        destroyOnClose={false}
+	        width={520}
+	      >
+	        {showNovelAiTaskPanel ? (
+	          <NovelAiParameterPanel
+	            mode="overrides"
+	            compact
+	            value={novelAiOverrides}
+	            defaultConfig={selectedBaseProfile.novelAiConfig || config.novelAiConfig}
+	            disabled={backendTaskWaiting}
+	            onChange={(next) => setNovelAiOverrides(stripEmptyNovelAiOverrides(next))}
+	          />
+	        ) : null}
+	      </Modal>
+		
+		      {/* Stats Bar - 紧凑设计 */}
       <div style={{ 
         padding: '12px 16px', 
         background: '#FAFAFA',
@@ -2310,36 +2511,42 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
           </div>
           
           {/* 图片预览区域 */}
-          {fileList.length > 0 && (
-            <div style={{ padding: '0 4px', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              {fileList.map((file, index) => (
-                <div key={file.uid} style={{ position: 'relative', width: 60, height: 60 }}>
-                  <Image
-                    src={file.thumbUrl || ''} 
-                    alt="preview" 
-                    style={{ width: 60, height: 60, objectFit: 'cover', borderRadius: 8 }}
-                    width={60}
-                    height={60}
-                  />
-                  <div 
-                    style={{ 
-                      position: 'absolute', top: -6, right: -6, 
-                      background: '#fff', borderRadius: '50%', cursor: 'pointer',
-                      boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
-                      zIndex: 1
-                    }}
-                    onClick={() => {
-                      const newFileList = [...fileList];
-                      newFileList.splice(index, 1);
-                      setFileList(newFileList);
-                    }}
-                  >
-                    <CloseCircleFilled style={{ color: '#FF5252', fontSize: 16 }} />
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+	          {fileList.length > 0 && (
+	            <div style={{ padding: '0 4px', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+	              {fileList.map((file, index) => {
+	                const isUploadActive = file.uid in uploadProgressByUid;
+	                const uploadPercent = uploadProgressByUid[file.uid];
+	                return (
+	                  <div key={file.uid} className="task-upload-preview">
+	                    <Image
+	                      src={file.thumbUrl || ''}
+	                      alt="preview"
+	                      preview={!isUploadActive}
+	                      style={{ width: 60, height: 60, objectFit: 'cover', borderRadius: 8 }}
+	                      width={60}
+	                      height={60}
+	                    />
+	                    {isUploadActive ? <UploadProgressOverlay percent={uploadPercent} /> : null}
+	                    <div
+	                      style={{
+	                        position: 'absolute', top: -6, right: -6,
+	                        background: '#fff', borderRadius: '50%', cursor: 'pointer',
+	                        boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+	                        zIndex: 3
+	                      }}
+	                      onClick={() => {
+	                        const newFileList = [...fileList];
+	                        newFileList.splice(index, 1);
+	                        setFileList(newFileList);
+	                      }}
+	                    >
+	                      <CloseCircleFilled style={{ color: '#FF5252', fontSize: 16 }} />
+	                    </div>
+	                  </div>
+	                );
+	              })}
+	            </div>
+	          )}
 
         {/* 工具栏 */}
         <div style={{ 
@@ -2361,11 +2568,11 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                 disabled={backendTaskWaiting}
               >
                 <Tooltip title="上传参考图">
-                  <Button
-                    size="small"
-                    icon={<UploadOutlined />}
-                    disabled={backendTaskWaiting}
-                    style={fileList.length > 0 ? {
+	                <Button
+	                  size="small"
+	                  icon={<UploadOutlined />}
+	                  disabled={backendTaskWaiting}
+	                  style={fileList.length > 0 ? {
                       background: '#FF9EB5', color: '#fff', border: 'none'
                     } : { 
                       background: '#fff', color: '#998888', border: '1px solid #E8E8E8' 
@@ -2473,12 +2680,12 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
                 停止
               </Button>
             ) : (
-              <Button 
-                type="primary" 
-                icon={<FireFilled />} 
-                onClick={handleGenerate} 
+              <Button
+                type="primary"
+                icon={<FireFilled />}
+                onClick={handleGenerate}
                 size="small"
-                disabled={backendTaskWaiting}
+                disabled={backendTaskWaiting || isUploadingImages}
                 style={{ borderRadius: 16, padding: '0 20px', height: 32, fontWeight: 700 }}
               >
                 生成

@@ -4,11 +4,10 @@ export const API_FORMATS = [
   'openai',
   'gemini',
   'vertex',
-  'vertex-express',
   'novelai',
 ];
 
-export const GOOGLE_API_FORMATS = ['gemini', 'vertex', 'vertex-express'];
+export const GOOGLE_API_FORMATS = ['gemini', 'vertex'];
 
 export const API_VERSION_OPTIONS = ['v1', 'v1beta', 'v1beta1'];
 
@@ -16,18 +15,24 @@ export const DEFAULT_API_BASES = {
   openai: 'https://api.openai.com/v1',
   gemini: 'https://generativelanguage.googleapis.com',
   vertex: 'https://aiplatform.googleapis.com',
-  'vertex-express': 'https://aiplatform.googleapis.com',
   novelai: 'https://image.novelai.net',
 };
 
 const VERSION_REGEX = /^v1(?:beta1|beta)?$/i;
 const API_MARKER_SEGMENTS = new Set(['projects', 'locations', 'publishers', 'models']);
 const IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'];
+const DEFAULT_VERTEX_LOCATION = 'us-central1';
+const CLOUD_PLATFORM_SCOPE = 'https://www.googleapis.com/auth/cloud-platform';
+const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const VERTEX_LOCATION_MAP_CACHE = new WeakMap();
+const GOOGLE_TOKEN_CACHE = new Map();
 
 export const isSupportedApiFormat = (value) => API_FORMATS.includes(value);
 
-export const coerceApiFormat = (value) =>
-  isSupportedApiFormat(value) ? value : 'openai';
+export const coerceApiFormat = (value) => {
+  if (value === 'vertex-express') return 'vertex';
+  return isSupportedApiFormat(value) ? value : 'openai';
+};
 
 export const isGoogleApiFormat = (value) => GOOGLE_API_FORMATS.includes(value);
 
@@ -104,13 +109,137 @@ export const getApiVersionFallback = (apiFormat) => {
       return 'v1beta';
     case 'vertex':
       return 'v1beta1';
-    case 'vertex-express':
-      return 'v1';
     case 'openai':
       return 'v1';
     default:
       return '';
   }
+};
+
+const getVertexAuthMode = (config = {}) =>
+  config.vertexAuthMode === 'apiKey' ? 'apiKey' : 'json';
+
+export const normalizeVertexModelName = (model = '') => {
+  const segments = String(model || '').trim().split('/').filter(Boolean);
+  const modelIndex = segments.lastIndexOf('models');
+  return modelIndex >= 0 ? segments.slice(modelIndex + 1).join('/') : segments.join('/');
+};
+
+const getVertexLocationMap = (items) => {
+  if (!Array.isArray(items)) return null;
+  const cached = VERTEX_LOCATION_MAP_CACHE.get(items);
+  if (cached) return cached;
+  const map = new Map();
+  items.forEach((item) => {
+    const model = normalizeVertexModelName(item?.model);
+    const location = String(item?.location || '').trim();
+    if (model && location) map.set(model, location);
+  });
+  VERTEX_LOCATION_MAP_CACHE.set(items, map);
+  return map;
+};
+
+export const resolveVertexLocation = (config = {}, model = '') => {
+  const modelLocation = getVertexLocationMap(config.vertexModelLocations)?.get(
+    normalizeVertexModelName(model),
+  );
+  return (
+    modelLocation ||
+    String(config.vertexDefaultLocation || config.vertexLocation || '').trim() ||
+    DEFAULT_VERTEX_LOCATION
+  );
+};
+
+const parseServiceAccount = (value) => {
+  if (value && typeof value === 'object') return value;
+  const text = String(value || '').trim();
+  if (!text) throw new Error('服务账号 JSON 未配置');
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('服务账号 JSON 格式不正确');
+  }
+};
+
+const base64UrlEncodeBytes = (bytes) => {
+  let binary = '';
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+};
+
+const base64ToBytes = (value) => {
+  if (typeof Buffer !== 'undefined') return new Uint8Array(Buffer.from(value, 'base64'));
+  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+};
+
+const encodeJson = (value) => base64UrlEncodeBytes(new TextEncoder().encode(JSON.stringify(value)));
+
+const importPrivateKey = async (pem) => {
+  const body = String(pem || '')
+    .replace(/-----BEGIN PRIVATE KEY-----/g, '')
+    .replace(/-----END PRIVATE KEY-----/g, '')
+    .replace(/\s+/g, '');
+  return crypto.subtle.importKey(
+    'pkcs8',
+    base64ToBytes(body),
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+};
+
+const signServiceAccountJwt = async (serviceAccount) => {
+  const now = Math.floor(Date.now() / 1000);
+  const header = {
+    alg: 'RS256',
+    typ: 'JWT',
+    ...(serviceAccount.private_key_id ? { kid: serviceAccount.private_key_id } : {}),
+  };
+  const claim = {
+    iss: serviceAccount.client_email,
+    scope: CLOUD_PLATFORM_SCOPE,
+    aud: GOOGLE_TOKEN_URL,
+    iat: now,
+    exp: now + 3600,
+  };
+  const unsigned = `${encodeJson(header)}.${encodeJson(claim)}`;
+  const key = await importPrivateKey(serviceAccount.private_key);
+  const signature = await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    new TextEncoder().encode(unsigned),
+  );
+  return `${unsigned}.${base64UrlEncodeBytes(new Uint8Array(signature))}`;
+};
+
+export const getGoogleAccessToken = async (serviceAccountJson) => {
+  const serviceAccount = parseServiceAccount(serviceAccountJson);
+  if (!serviceAccount.client_email || !serviceAccount.private_key) {
+    throw new Error('服务账号 JSON 缺少 client_email 或 private_key');
+  }
+  const cacheKey = `${serviceAccount.client_email}:${serviceAccount.private_key_id || ''}`;
+  const cached = GOOGLE_TOKEN_CACHE.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now() + 60000) return cached.token;
+  const assertion = await signServiceAccountJwt(serviceAccount);
+  const body = new URLSearchParams({
+    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+    assertion,
+  });
+  const response = await fetch(GOOGLE_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  if (!response.ok) throw new Error(`获取 Google access token 失败: ${response.status}`);
+  const data = await response.json();
+  if (!data?.access_token) throw new Error('Google token 响应缺少 access_token');
+  GOOGLE_TOKEN_CACHE.set(cacheKey, {
+    token: data.access_token,
+    expiresAt: Date.now() + Math.max(0, Number(data.expires_in || 0) * 1000),
+  });
+  return data.access_token;
 };
 
 const addBearerPrefix = (apiKey = '') => {
@@ -166,13 +295,18 @@ const applyModelPath = (segments, modelValue) => {
   }
 };
 
+const setVertexOriginLocation = (origin, host, location) => {
+  if (!location || host !== 'aiplatform.googleapis.com') return origin;
+  return origin.replace('//aiplatform.googleapis.com', `//${location}-aiplatform.googleapis.com`);
+};
+
 const replaceWithFullModelPath = (segments, version, modelSegments) => {
   segments.splice(0);
   if (version) segments.push(version);
   segments.push(...modelSegments);
 };
 
-export const buildGoogleGenerateRequest = (config = {}, options = {}) => {
+export const buildGoogleGenerateRequest = async (config = {}, options = {}) => {
   const apiFormat = coerceApiFormat(config.apiFormat);
   if (!isGoogleApiFormat(apiFormat)) {
     throw new Error(`Unsupported Google API format: ${apiFormat}`);
@@ -180,12 +314,11 @@ export const buildGoogleGenerateRequest = (config = {}, options = {}) => {
 
   const apiUrl = resolveApiUrl(config.apiUrl, apiFormat);
   const baseInfo = normalizeApiBase(apiUrl);
-  const baseOrigin = baseInfo.origin || trimUrl(apiUrl);
-  const version = resolveApiVersion(
-    apiUrl,
-    config.apiVersion,
-    getApiVersionFallback(apiFormat),
-  );
+  let baseOrigin = baseInfo.origin || trimUrl(apiUrl);
+  const version =
+    apiFormat === 'vertex' && getVertexAuthMode(config) === 'apiKey'
+      ? 'v1'
+      : resolveApiVersion(apiUrl, config.apiVersion, getApiVersionFallback(apiFormat));
   const segments = [...baseInfo.segments];
   insertVersionIfMissing(segments, version);
 
@@ -198,25 +331,32 @@ export const buildGoogleGenerateRequest = (config = {}, options = {}) => {
 
   if (apiFormat === 'gemini') {
     applyModelPath(segments, modelValue);
-  } else if (apiFormat === 'vertex-express') {
-    ensureMarkerValue(segments, 'publishers', publisher);
-    applyModelPath(segments, modelValue.replace(/^models\//, ''));
   } else {
-    const projectId =
-      String(config.vertexProjectId || '').trim() ||
-      extractVertexProjectId(apiUrl) ||
-      '';
-    const location = String(config.vertexLocation || '').trim() || 'us-central1';
-    if (modelHasProjectPath) {
-      replaceWithFullModelPath(segments, version, modelSegments);
-    } else {
-      if (!projectId && !segments.includes('projects')) {
-        throw new Error('Vertex project ID is required');
-      }
-      ensureMarkerValue(segments, 'projects', projectId);
-      ensureMarkerValue(segments, 'locations', location);
+    const vertexAuthMode = getVertexAuthMode(config);
+    const location = resolveVertexLocation(config, modelValue);
+    baseOrigin = setVertexOriginLocation(baseOrigin, baseInfo.host, location);
+    if (vertexAuthMode === 'apiKey') {
       ensureMarkerValue(segments, 'publishers', publisher);
       applyModelPath(segments, modelValue.replace(/^models\//, ''));
+    } else {
+      const serviceAccount =
+        config.vertexAccessToken || config.vertexProjectId ? null : parseServiceAccount(config.apiKey);
+      const projectId =
+        String(config.vertexProjectId || '').trim() ||
+        serviceAccount?.project_id ||
+        extractVertexProjectId(apiUrl) ||
+        '';
+      if (modelHasProjectPath) {
+        replaceWithFullModelPath(segments, version, modelSegments);
+      } else {
+        if (!projectId && !segments.includes('projects')) {
+          throw new Error('项目 ID 未配置');
+        }
+        ensureMarkerValue(segments, 'projects', projectId);
+        ensureMarkerValue(segments, 'locations', location);
+        ensureMarkerValue(segments, 'publishers', publisher);
+        applyModelPath(segments, modelValue.replace(/^models\//, ''));
+      }
     }
   }
 
@@ -225,11 +365,15 @@ export const buildGoogleGenerateRequest = (config = {}, options = {}) => {
   const headers = { 'Content-Type': 'application/json' };
   const isOfficialGemini =
     apiFormat === 'gemini' && baseInfo.host === 'generativelanguage.googleapis.com';
-  const isOfficialVertexExpress =
-    apiFormat === 'vertex-express' && baseInfo.host === 'aiplatform.googleapis.com';
+  const isVertexApiKey =
+    apiFormat === 'vertex' && getVertexAuthMode(config) === 'apiKey';
 
-  if (isOfficialGemini || isOfficialVertexExpress) {
+  if (isOfficialGemini || isVertexApiKey) {
     url += `${url.includes('?') ? '&' : '?'}key=${encodeURIComponent(config.apiKey || '')}`;
+  } else if (apiFormat === 'vertex' && getVertexAuthMode(config) === 'json') {
+    headers.Authorization = addBearerPrefix(
+      config.vertexAccessToken || await getGoogleAccessToken(config.apiKey),
+    );
   } else {
     headers.Authorization = addBearerPrefix(config.apiKey);
   }
@@ -237,18 +381,86 @@ export const buildGoogleGenerateRequest = (config = {}, options = {}) => {
   return { url, headers };
 };
 
+export const buildGoogleModelsRequest = async (config = {}) => {
+  const apiFormat = coerceApiFormat(config.apiFormat);
+  if (!isGoogleApiFormat(apiFormat)) {
+    throw new Error(`Unsupported Google API format: ${apiFormat}`);
+  }
+  const apiUrl = resolveApiUrl(config.apiUrl, apiFormat);
+  const baseInfo = normalizeApiBase(apiUrl);
+  let baseOrigin = baseInfo.origin || trimUrl(apiUrl);
+  const version =
+    apiFormat === 'vertex' && getVertexAuthMode(config) === 'apiKey'
+      ? 'v1'
+      : resolveApiVersion(apiUrl, config.apiVersion, getApiVersionFallback(apiFormat));
+  const segments = [...baseInfo.segments];
+  insertVersionIfMissing(segments, version);
+  const headers = {};
+
+  if (apiFormat === 'gemini') {
+    const modelIndex = segments.indexOf('models');
+    if (modelIndex >= 0) segments.splice(modelIndex + 1);
+    else segments.push('models');
+    let url = `${baseOrigin}/${segments.join('/')}`;
+    if (baseInfo.host === 'generativelanguage.googleapis.com') {
+      url += `?key=${encodeURIComponent(config.apiKey || '')}`;
+    } else {
+      headers.Authorization = addBearerPrefix(config.apiKey);
+    }
+    return { url, headers };
+  }
+
+  const publisher = String(config.vertexPublisher || '').trim() || 'google';
+  const location = resolveVertexLocation(config, config.model);
+  baseOrigin = setVertexOriginLocation(baseOrigin, baseInfo.host, location);
+  if (getVertexAuthMode(config) === 'apiKey') {
+    ensureMarkerValue(segments, 'publishers', publisher);
+    const modelIndex = segments.indexOf('models');
+    if (modelIndex >= 0) segments.splice(modelIndex + 1);
+    else segments.push('models');
+    return {
+      url: `${baseOrigin}/${segments.join('/')}?key=${encodeURIComponent(config.apiKey || '')}`,
+      headers,
+    };
+  }
+
+  const serviceAccount =
+    config.vertexAccessToken || config.vertexProjectId ? null : parseServiceAccount(config.apiKey);
+  const projectId =
+    String(config.vertexProjectId || '').trim() ||
+    serviceAccount?.project_id ||
+    extractVertexProjectId(apiUrl) ||
+    '';
+  if (!projectId && !segments.includes('projects')) throw new Error('项目 ID 未配置');
+  ensureMarkerValue(segments, 'projects', projectId);
+  ensureMarkerValue(segments, 'locations', location);
+  ensureMarkerValue(segments, 'publishers', publisher);
+  const modelIndex = segments.indexOf('models');
+  if (modelIndex >= 0) segments.splice(modelIndex + 1);
+  else segments.push('models');
+  headers.Authorization = addBearerPrefix(
+    config.vertexAccessToken || await getGoogleAccessToken(config.apiKey),
+  );
+  return { url: `${baseOrigin}/${segments.join('/')}`, headers };
+};
+
 const clampNumber = (value, min, max) => Math.min(max, Math.max(min, value));
 
 export const buildGeminiGenerationConfig = (config = {}) => {
   const generationConfig = {};
   if (config.includeImageConfig) {
-    const imageSize = config.imageConfig?.imageSize || '2K';
+    const imageSize = config.imageConfig?.imageSize || 'auto';
     const aspectRatio = config.imageConfig?.aspectRatio || 'auto';
-    const imageConfig = { imageSize };
+    const imageConfig = {};
+    if (imageSize && imageSize !== 'auto') {
+      imageConfig.imageSize = imageSize;
+    }
     if (aspectRatio && aspectRatio !== 'auto') {
       imageConfig.aspectRatio = aspectRatio;
     }
-    generationConfig.imageConfig = imageConfig;
+    if (Object.keys(imageConfig).length > 0) {
+      generationConfig.imageConfig = imageConfig;
+    }
     if (config.useResponseModalities) {
       generationConfig.responseModalities = ['TEXT', 'IMAGE'];
     }
@@ -335,75 +547,77 @@ export const buildOpenAiImagesUrl = (openAiBase, hasReferenceImages) => {
   return `${normalized}/images/${hasReferenceImages ? 'edits' : 'generations'}`;
 };
 
-const sizeLongEdge = (imageSize = '1K') => {
-  switch (String(imageSize).toUpperCase()) {
-    case '512':
-      return 512;
-    case '2K':
-      return 1216;
-    case '4K':
-      return 1536;
-    case '1K':
-    default:
-      return 1024;
-  }
+const getPositiveInt = (value, fallback) => {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.round(number) : fallback;
 };
 
-const parseAspectRatio = (value = '1:1') => {
-  if (!value || value === 'auto') return [1, 1];
-  const match = String(value).match(/^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/);
-  if (!match) return [1, 1];
-  const width = Number(match[1]);
-  const height = Number(match[2]);
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
-    return [1, 1];
-  }
-  return [width, height];
+const getOptionalSeed = (value) => {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, Math.round(number)) : null;
 };
 
-const roundToMultiple = (value, step) => Math.max(step, Math.round(value / step) * step);
+const NEGATIVE_PROMPT_MARKER =
+  /(负面提示词|反向提示词|Negative\s+Prompt|Undesired\s+Content|UC)\s*[:：]/i;
 
-export const getNovelAiDimensions = (imageConfig = {}) => {
-  const longEdge = sizeLongEdge(imageConfig.imageSize);
-  const [ratioWidth, ratioHeight] = parseAspectRatio(imageConfig.aspectRatio);
-  const landscape = ratioWidth >= ratioHeight;
-  const width = landscape ? longEdge : longEdge * (ratioWidth / ratioHeight);
-  const height = landscape ? longEdge * (ratioHeight / ratioWidth) : longEdge;
+export const splitNovelAiPrompt = (prompt = '') => {
+  const text = String(prompt || '').trim();
+  const match = NEGATIVE_PROMPT_MARKER.exec(text);
+  if (!match) return { input: text, uc: '' };
   return {
-    width: clampNumber(roundToMultiple(width, 64), 512, 1536),
-    height: clampNumber(roundToMultiple(height, 64), 512, 1536),
+    input: text.slice(0, match.index).trim(),
+    uc: text.slice(match.index + match[0].length).trim(),
   };
 };
+
+const joinNovelAiUc = (...items) =>
+  items
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .join(', ');
 
 export const buildNovelAiRequest = (config = {}, options = {}) => {
   const apiUrl = resolveApiUrl(config.apiUrl, 'novelai');
   const base = trimUrl(apiUrl);
   const url = /\/ai\/generate-image$/i.test(base) ? base : `${base}/ai/generate-image`;
-  const dimensions = getNovelAiDimensions(config.imageConfig);
+  const novelAiConfig = config.novelAiConfig && typeof config.novelAiConfig === 'object'
+    ? config.novelAiConfig
+    : {};
+  const prompt = splitNovelAiPrompt(options.prompt);
+  const seed = getOptionalSeed(novelAiConfig.seed);
   const custom = parseCustomJson(config.customJson) || {};
   const customParameters =
     custom.parameters && typeof custom.parameters === 'object' && !Array.isArray(custom.parameters)
       ? custom.parameters
       : {};
+  const uc = joinNovelAiUc(novelAiConfig.uc, prompt.uc);
   const parameters = {
-    params_version: 3,
-    width: dimensions.width,
-    height: dimensions.height,
-    scale: 5,
-    sampler: 'k_euler_ancestral',
-    steps: 28,
+	    params_version: 3,
+	    width: getPositiveInt(novelAiConfig.width, 1024),
+	    height: getPositiveInt(novelAiConfig.height, 1024),
+    scale: typeof novelAiConfig.scale === 'number' ? novelAiConfig.scale : 5,
+    sampler: novelAiConfig.sampler || 'k_euler_ancestral',
+    steps: getPositiveInt(novelAiConfig.steps, 28),
     n_samples: 1,
-    ucPreset: 0,
-    qualityToggle: true,
-    dynamic_thresholding: false,
+    ucPreset: typeof novelAiConfig.ucPreset === 'number' ? novelAiConfig.ucPreset : 0,
+    ...(uc ? { uc } : {}),
+    qualityToggle:
+      typeof novelAiConfig.qualityToggle === 'boolean' ? novelAiConfig.qualityToggle : true,
+    dynamic_thresholding:
+      typeof novelAiConfig.dynamicThresholding === 'boolean'
+        ? novelAiConfig.dynamicThresholding
+        : false,
+    sm: Boolean(novelAiConfig.sm),
+    sm_dyn: Boolean(novelAiConfig.smDyn),
+    cfg_rescale: typeof novelAiConfig.cfgRescale === 'number' ? novelAiConfig.cfgRescale : 0,
+    noise_schedule: novelAiConfig.noiseSchedule || 'native',
+    ...(seed === null ? {} : { seed }),
     legacy: false,
     add_original_image: false,
-    cfg_rescale: 0,
-    noise_schedule: 'native',
     ...customParameters,
   };
   const basePayload = {
-    input: String(options.prompt || '').trim(),
+    input: prompt.input,
     model: String(config.model || '').trim(),
     action: 'generate',
     parameters,

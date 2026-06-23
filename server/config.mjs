@@ -34,6 +34,7 @@ export const saveDir = path.resolve(rootDir, 'saved-images')
 export const distDir = path.resolve(rootDir, 'dist')
 export const serverDataDir = path.resolve(rootDir, 'server-data')
 export const backendTasksDir = path.join(serverDataDir, 'tasks')
+export const backendWorkflowsDir = path.join(serverDataDir, 'workflows')
 export const backendImagesDir = path.join(serverDataDir, 'images')
 export const backendStatePath = path.join(serverDataDir, 'state.json')
 export const backendCollectionPath = path.join(serverDataDir, 'collection.json')
@@ -55,17 +56,20 @@ export const DEFAULT_BACKEND_CONFIG = {
   apiFormat: 'openai',
   openaiEndpointMode: 'chat',
   apiVersion: 'v1',
+  vertexAuthMode: 'json',
   vertexProjectId: '',
-  vertexLocation: 'us-central1',
+  vertexLocation: '',
+  vertexDefaultLocation: '',
+  vertexModelLocations: [],
   vertexPublisher: 'google',
   stream: false,
   enableCollection: false,
 }
 
-export const API_FORMATS = ['openai', 'gemini', 'vertex', 'vertex-express', 'novelai']
+export const API_FORMATS = ['openai', 'gemini', 'vertex', 'novelai']
 
 export const coerceApiFormat = (value) =>
-  API_FORMATS.includes(value) ? value : 'openai'
+  value === 'vertex-express' ? 'vertex' : API_FORMATS.includes(value) ? value : 'openai'
 
 export const FORMAT_CONFIG_KEYS = [
   'apiUrl',
@@ -73,16 +77,20 @@ export const FORMAT_CONFIG_KEYS = [
   'model',
   'apiVersion',
   'openaiEndpointMode',
+  'vertexAuthMode',
   'vertexProjectId',
   'vertexLocation',
+  'vertexDefaultLocation',
+  'vertexModelLocations',
   'vertexPublisher',
   'thinkingBudget',
   'includeThoughts',
   'includeImageConfig',
-  'includeSafetySettings',
-  'safety',
-  'imageConfig',
-  'webpQuality',
+	  'includeSafetySettings',
+	  'safety',
+	  'imageConfig',
+	  'novelAiConfig',
+	  'webpQuality',
   'useResponseModalities',
   'customJson',
 ]

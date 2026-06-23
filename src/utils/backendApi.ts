@@ -2,10 +2,17 @@ import type { AppConfig } from '../types/app';
 import type { CollectionItem } from '../types/collection';
 import type { GlobalStats } from '../types/stats';
 import type { PersistedImageTaskState } from '../types/imageTask';
+import type {
+  WorkflowGenerationOptions,
+  WorkflowProject,
+  WorkflowReferenceImage,
+  WorkflowState,
+} from '../types/workflow';
 import type { ApiFormat } from './apiUrl';
 import type { FormatConfig } from '../app/storage';
+import axios from 'axios';
 import { safeStorageGet, safeStorageRemove, safeStorageSet } from './storage';
-import { formatResponseErrorMessage } from './httpError';
+import { formatHttpErrorMessage, readResponseBodySafely } from './httpError';
 
 export interface BackendState {
   config: AppConfig;
@@ -56,14 +63,62 @@ const buildBackendHttpError = async (
   response: Response,
   code?: string,
 ) => {
+  const body = await readResponseBodySafely(response);
   const error = new Error(
-    await formatResponseErrorMessage(response, response.statusText || '请求失败'),
-  ) as Error & { code?: string; status?: number };
+    formatHttpErrorMessage({
+      status: response.status,
+      statusText: response.statusText,
+      body,
+      fallback: response.statusText || '请求失败',
+    }),
+  ) as Error & {
+    code?: string;
+    status?: number;
+    body?: unknown;
+    workflowId?: string;
+    workflowTitle?: string;
+  };
   error.status = response.status;
+  error.body = body;
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    const record = body as Record<string, unknown>;
+    if (typeof record.workflowId === 'string') error.workflowId = record.workflowId;
+    if (typeof record.workflowTitle === 'string') error.workflowTitle = record.workflowTitle;
+  }
   if (code) {
     error.code = code;
   }
   return error;
+};
+
+const buildBackendAxiosError = (error: unknown) => {
+  if (!axios.isAxiosError(error)) return error;
+  const response = error.response;
+  const next = new Error(
+    formatHttpErrorMessage({
+      status: response?.status,
+      statusText: response?.statusText,
+      body: response?.data,
+      fallback: error.message || '请求失败',
+    }),
+  ) as Error & {
+    code?: string;
+    status?: number;
+    body?: unknown;
+    workflowId?: string;
+    workflowTitle?: string;
+  };
+  next.status = response?.status;
+  next.body = response?.data;
+  if (response?.data && typeof response.data === 'object' && !Array.isArray(response.data)) {
+    const record = response.data as Record<string, unknown>;
+    if (typeof record.workflowId === 'string') next.workflowId = record.workflowId;
+    if (typeof record.workflowTitle === 'string') next.workflowTitle = record.workflowTitle;
+  }
+  if (response?.status === 401) {
+    next.code = 'BACKEND_UNAUTHORIZED';
+  }
+  return next;
 };
 
 const backendFetch = async (path: string, options: RequestInit = {}) => {
@@ -181,6 +236,16 @@ type BackendGenerationOptions = {
   runtimeConfig?: AppConfig;
 };
 
+export interface BackendWorkflowGeneratedImage {
+  status: 'success' | 'error';
+  localKey?: string;
+  sourceUrl?: string;
+  mimeType?: string;
+  bytes?: number;
+  duration?: number;
+  error?: string;
+}
+
 export const generateBackendTask = async (
   taskId: string,
   options: BackendGenerationOptions = {},
@@ -212,25 +277,125 @@ export const stopBackendSubTask = async (
     body: { subTaskId, mode },
   });
 
+export const generateBackendWorkflowNode = async (
+  taskId: string,
+  payload: {
+    nodeId: string;
+    apiProfileId?: string;
+    prompt: string;
+    referenceImages: WorkflowReferenceImage[];
+    count: number;
+    generationOptions?: WorkflowGenerationOptions;
+    runtimeConfig?: AppConfig;
+  },
+) =>
+  backendJson<{ images: BackendWorkflowGeneratedImage[] }>(
+    `/api/backend/task/${encodeURIComponent(taskId)}/workflow/generate`,
+    {
+      method: 'POST',
+      body: payload,
+    },
+	  );
+
+export const fetchBackendWorkflowProjects = async () =>
+  backendJson<WorkflowProject[]>('/api/backend/workflows');
+
+export const createBackendWorkflowProject = async (payload: {
+  id?: string;
+  title?: string;
+  linkedTaskId?: string;
+  state?: WorkflowState;
+}) =>
+  backendJson<WorkflowProject>('/api/backend/workflows', {
+    method: 'POST',
+    body: payload,
+  });
+
+export const patchBackendWorkflowProject = async (
+  projectId: string,
+  payload: Partial<Pick<WorkflowProject, 'title' | 'state'>> & { linkedTaskId?: string | null },
+) =>
+  backendJson<WorkflowProject>(`/api/backend/workflow/${encodeURIComponent(projectId)}`, {
+    method: 'PATCH',
+    body: payload,
+  });
+
+export const deleteBackendWorkflowProject = async (projectId: string) =>
+  backendJson<{ ok: true }>(`/api/backend/workflow/${encodeURIComponent(projectId)}`, {
+    method: 'DELETE',
+  });
+
+export const generateBackendWorkflowProjectNode = async (
+  projectId: string,
+  payload: {
+    nodeId: string;
+    apiProfileId?: string;
+    prompt: string;
+    referenceImages: WorkflowReferenceImage[];
+    count: number;
+    generationOptions?: WorkflowGenerationOptions;
+    runtimeConfig?: AppConfig;
+  },
+) =>
+  backendJson<{ images: BackendWorkflowGeneratedImage[] }>(
+    `/api/backend/workflow/${encodeURIComponent(projectId)}/generate`,
+    {
+      method: 'POST',
+      body: payload,
+    },
+	  );
+
+export interface BackendUploadProgress {
+  loaded: number;
+  total?: number;
+  percent?: number;
+}
+
+type BackendUploadOptions = {
+  onUploadProgress?: (progress: BackendUploadProgress) => void;
+};
+
 export const uploadBackendImage = async (
   blob: Blob,
   meta: { name?: string; lastModified?: number } = {},
+  options: BackendUploadOptions = {},
 ) => {
-  const headers: HeadersInit = {
+  const headers = buildBackendHeaders({
     'Content-Type': blob.type || 'application/octet-stream',
-  };
-  if (typeof meta.lastModified === 'number') {
-    headers['X-Upload-Last-Modified'] = String(meta.lastModified);
-  }
-  const response = await backendFetch('/api/backend/upload', {
-    method: 'POST',
-    headers,
-    body: blob,
   });
-  if (!response.ok) {
-    throw await buildBackendHttpError(response);
+  if (typeof meta.lastModified === 'number') {
+    headers.set('X-Upload-Last-Modified', String(meta.lastModified));
   }
-  return (await response.json()) as { key: string; url: string };
+  const headerRecord: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    headerRecord[key] = value;
+  });
+
+  try {
+    const response = await axios.post<{ key: string; url: string }>(
+      '/api/backend/upload',
+      blob,
+      {
+        headers: headerRecord,
+        onUploadProgress: (event) => {
+          const total = typeof event.total === 'number' && event.total > 0
+            ? event.total
+            : undefined;
+          const percent = total
+            ? (event.loaded / total) * 100
+            : undefined;
+          options.onUploadProgress?.({
+            loaded: event.loaded,
+            total,
+            percent,
+          });
+        },
+      },
+    );
+    return response.data;
+  } catch (err) {
+    throw buildBackendAxiosError(err);
+  }
 };
 
 export const buildBackendImageUrl = (key: string) => {

@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import type { AppConfig, TaskConfig } from '../types/app';
 import type { CollectionItem } from '../types/collection';
 import type { GlobalStats } from '../types/stats';
+import type { WorkflowProject } from '../types/workflow';
 import { safeStorageGet, safeStorageRemove, safeStorageSet } from '../utils/storage';
 import { openImageDb, IMAGE_STORE_NAME } from '../utils/imageDb';
 import { buildPromptKey } from '../utils/prompt';
@@ -11,6 +12,7 @@ export const STORAGE_KEYS = {
   config: 'moe-image-config',
   configByFormat: 'moe-image-config-by-format',
   tasks: 'moe-image-tasks',
+  workflowProjects: 'moe-image-workflow-projects',
   globalStats: 'moe-image-global-stats',
   collection: 'moe-image-collection',
 };
@@ -26,16 +28,20 @@ export type FormatConfig = Pick<
   | 'model'
   | 'apiVersion'
   | 'openaiEndpointMode'
+  | 'vertexAuthMode'
   | 'vertexProjectId'
   | 'vertexLocation'
+  | 'vertexDefaultLocation'
+  | 'vertexModelLocations'
   | 'vertexPublisher'
   | 'thinkingBudget'
   | 'includeThoughts'
   | 'includeImageConfig'
-  | 'includeSafetySettings'
-  | 'safety'
-  | 'imageConfig'
-  | 'webpQuality'
+	  | 'includeSafetySettings'
+	  | 'safety'
+	  | 'imageConfig'
+	  | 'novelAiConfig'
+	  | 'webpQuality'
   | 'useResponseModalities'
   | 'customJson'
 >;
@@ -53,6 +59,24 @@ const createDefaultImageConfig = () => ({
   aspectRatio: 'auto',
 });
 
+const createDefaultNovelAiConfig = () => ({
+  width: 1024,
+  height: 1024,
+  aspectRatio: '1:1',
+  lockAspectRatio: false,
+  steps: 28,
+  scale: 5,
+  sampler: 'k_euler_ancestral',
+  ucPreset: 0,
+  uc: '',
+  qualityToggle: true,
+  dynamicThresholding: false,
+  sm: false,
+  smDyn: false,
+  cfgRescale: 0,
+  noiseSchedule: 'native',
+});
+
 const createDefaultAdvancedConfig = () => ({
   thinkingBudget: 128,
   includeThoughts: true,
@@ -60,6 +84,7 @@ const createDefaultAdvancedConfig = () => ({
   includeSafetySettings: true,
   safety: createDefaultSafetySettings(),
   imageConfig: createDefaultImageConfig(),
+  novelAiConfig: createDefaultNovelAiConfig(),
   webpQuality: 95,
   useResponseModalities: false,
   customJson: '',
@@ -72,8 +97,11 @@ const DEFAULT_FORMAT_CONFIGS: Record<ApiFormat, FormatConfig> = {
     model: '',
     apiVersion: 'v1',
     openaiEndpointMode: 'chat',
+    vertexAuthMode: 'json',
     vertexProjectId: '',
     vertexLocation: 'global',
+    vertexDefaultLocation: '',
+    vertexModelLocations: [],
     vertexPublisher: 'google',
     ...createDefaultAdvancedConfig(),
   },
@@ -83,8 +111,11 @@ const DEFAULT_FORMAT_CONFIGS: Record<ApiFormat, FormatConfig> = {
     model: '',
     apiVersion: 'v1beta',
     openaiEndpointMode: 'chat',
+    vertexAuthMode: 'json',
     vertexProjectId: '',
     vertexLocation: 'global',
+    vertexDefaultLocation: '',
+    vertexModelLocations: [],
     vertexPublisher: 'google',
     ...createDefaultAdvancedConfig(),
   },
@@ -94,19 +125,11 @@ const DEFAULT_FORMAT_CONFIGS: Record<ApiFormat, FormatConfig> = {
     model: '',
     apiVersion: 'v1beta1',
     openaiEndpointMode: 'chat',
+    vertexAuthMode: 'json',
     vertexProjectId: '',
-    vertexLocation: 'us-central1',
-    vertexPublisher: 'google',
-    ...createDefaultAdvancedConfig(),
-  },
-  'vertex-express': {
-    apiUrl: 'https://aiplatform.googleapis.com',
-    apiKey: '',
-    model: '',
-    apiVersion: 'v1',
-    openaiEndpointMode: 'chat',
-    vertexProjectId: '',
-    vertexLocation: 'global',
+    vertexLocation: '',
+    vertexDefaultLocation: '',
+    vertexModelLocations: [],
     vertexPublisher: 'google',
     ...createDefaultAdvancedConfig(),
   },
@@ -116,8 +139,11 @@ const DEFAULT_FORMAT_CONFIGS: Record<ApiFormat, FormatConfig> = {
     model: '',
     apiVersion: '',
     openaiEndpointMode: 'chat',
+    vertexAuthMode: 'json',
     vertexProjectId: '',
     vertexLocation: 'global',
+    vertexDefaultLocation: '',
+    vertexModelLocations: [],
     vertexPublisher: 'google',
     ...createDefaultAdvancedConfig(),
   },
@@ -141,6 +167,8 @@ const DEFAULT_GLOBAL_STATS: GlobalStats = {
 const coerceConfigString = (value: unknown) => (typeof value === 'string' ? value : '');
 const coerceOpenAiEndpointMode = (value: unknown): AppConfig['openaiEndpointMode'] =>
   value === 'images' ? 'images' : 'chat';
+const coerceVertexAuthMode = (value: unknown, apiFormat?: unknown): AppConfig['vertexAuthMode'] =>
+  value === 'apiKey' || apiFormat === 'vertex-express' ? 'apiKey' : 'json';
 const coerceBoolean = (value: unknown, fallback: boolean) =>
   typeof value === 'boolean' ? value : fallback;
 const coerceNumber = (value: unknown, fallback: number) =>
@@ -181,10 +209,50 @@ const coerceImageConfig = (value: unknown) => {
   return { imageSize, aspectRatio };
 };
 
+const coerceNovelAiConfig = (value: unknown) => {
+  const defaults = createDefaultNovelAiConfig();
+  if (!value || typeof value !== 'object') return defaults;
+  const raw = value as Record<string, unknown>;
+  const seed = coerceNumber(raw.seed, Number.NaN);
+  return {
+    width: Math.max(1, Math.round(coerceNumber(raw.width, defaults.width))),
+    height: Math.max(1, Math.round(coerceNumber(raw.height, defaults.height))),
+    aspectRatio: coerceConfigString(raw.aspectRatio) || defaults.aspectRatio,
+    lockAspectRatio: coerceBoolean(raw.lockAspectRatio, defaults.lockAspectRatio),
+    steps: clampNumber(Math.round(coerceNumber(raw.steps, defaults.steps)), 1, 50),
+    scale: clampNumber(coerceNumber(raw.scale, defaults.scale), 0, 20),
+    sampler: coerceConfigString(raw.sampler) || defaults.sampler,
+    ucPreset: clampNumber(Math.round(coerceNumber(raw.ucPreset, defaults.ucPreset)), 0, 3),
+    uc: coerceConfigString(raw.uc),
+    qualityToggle: coerceBoolean(raw.qualityToggle, defaults.qualityToggle),
+    dynamicThresholding: coerceBoolean(raw.dynamicThresholding, defaults.dynamicThresholding),
+    sm: coerceBoolean(raw.sm, defaults.sm),
+    smDyn: coerceBoolean(raw.smDyn, defaults.smDyn),
+    cfgRescale: clampNumber(coerceNumber(raw.cfgRescale, defaults.cfgRescale), 0, 1),
+    noiseSchedule: coerceConfigString(raw.noiseSchedule) || defaults.noiseSchedule,
+    ...(Number.isFinite(seed) ? { seed: Math.max(0, Math.round(seed)) } : {}),
+  };
+};
+
+const coerceVertexModelLocations = (value: unknown) => {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const raw = item as Record<string, unknown>;
+      const model = coerceConfigString(raw.model).trim();
+      const location = coerceConfigString(raw.location).trim();
+      return model && location ? { model, location } : null;
+    })
+    .filter((item): item is { model: string; location: string } => Boolean(item));
+};
+
 const normalizeApiProfiles = (profiles: AppConfig['apiProfiles']) =>
   profiles?.map((profile) => ({
     ...profile,
     apiFormat: coerceApiFormat(profile.apiFormat) as ApiFormat,
+    vertexAuthMode: coerceVertexAuthMode(profile.vertexAuthMode, profile.apiFormat),
+    vertexModelLocations: coerceVertexModelLocations(profile.vertexModelLocations),
     openaiEndpointMode: coerceOpenAiEndpointMode(profile.openaiEndpointMode),
   }));
 
@@ -194,16 +262,20 @@ export const buildFormatConfig = (value: Partial<AppConfig> = {}): FormatConfig 
   model: coerceConfigString(value.model),
   apiVersion: coerceConfigString(value.apiVersion),
   openaiEndpointMode: coerceOpenAiEndpointMode(value.openaiEndpointMode),
+  vertexAuthMode: coerceVertexAuthMode(value.vertexAuthMode, value.apiFormat),
   vertexProjectId: coerceConfigString(value.vertexProjectId),
   vertexLocation: coerceConfigString(value.vertexLocation),
+  vertexDefaultLocation: coerceConfigString(value.vertexDefaultLocation || value.vertexLocation),
+  vertexModelLocations: coerceVertexModelLocations(value.vertexModelLocations),
   vertexPublisher: coerceConfigString(value.vertexPublisher),
   thinkingBudget: coerceThinkingBudget(value.thinkingBudget),
   includeThoughts: coerceBoolean(value.includeThoughts, true),
   includeImageConfig: coerceBoolean(value.includeImageConfig, true),
   includeSafetySettings: coerceBoolean(value.includeSafetySettings, true),
-  safety: coerceSafetySettings(value.safety),
-  imageConfig: coerceImageConfig(value.imageConfig),
-  webpQuality: coerceWebpQuality(value.webpQuality),
+	  safety: coerceSafetySettings(value.safety),
+	  imageConfig: coerceImageConfig(value.imageConfig),
+	  novelAiConfig: coerceNovelAiConfig(value.novelAiConfig),
+	  webpQuality: coerceWebpQuality(value.webpQuality),
   useResponseModalities: coerceBoolean(value.useResponseModalities, false),
   customJson: coerceConfigString(value.customJson),
 });
@@ -211,13 +283,13 @@ export const buildFormatConfig = (value: Partial<AppConfig> = {}): FormatConfig 
 export const getDefaultFormatConfig = (apiFormat: ApiFormat): FormatConfig =>
   buildFormatConfig(DEFAULT_FORMAT_CONFIGS[apiFormat]);
 
-const loadFormatConfigMap = (): Partial<Record<ApiFormat, Partial<FormatConfig>>> => {
+const loadFormatConfigMap = (): Record<string, Partial<FormatConfig>> => {
   const raw = safeStorageGet(STORAGE_KEYS.configByFormat, 'app cache');
   if (!raw) return {};
   try {
     const data = JSON.parse(raw);
     if (!data || typeof data !== 'object') return {};
-    return data as Record<ApiFormat, Partial<FormatConfig>>;
+    return data as Record<string, Partial<FormatConfig>>;
   } catch (err) {
     console.warn('Failed to parse config-by-format cache:', err);
     return {};
@@ -238,19 +310,23 @@ export const loadConfig = (): AppConfig => {
         apiUrl: finalConfig.apiUrl,
         apiKey: finalConfig.apiKey,
         model: finalConfig.model,
-        apiFormat: finalConfig.apiFormat,
-        openaiEndpointMode: finalConfig.openaiEndpointMode,
-        apiVersion: finalConfig.apiVersion,
-        vertexProjectId: finalConfig.vertexProjectId,
-        vertexLocation: finalConfig.vertexLocation,
-        vertexPublisher: finalConfig.vertexPublisher,
+	        apiFormat: finalConfig.apiFormat,
+	        openaiEndpointMode: finalConfig.openaiEndpointMode,
+	        apiVersion: finalConfig.apiVersion,
+	        vertexAuthMode: finalConfig.vertexAuthMode,
+	        vertexProjectId: finalConfig.vertexProjectId,
+	        vertexLocation: finalConfig.vertexLocation,
+	        vertexDefaultLocation: finalConfig.vertexDefaultLocation,
+	        vertexModelLocations: finalConfig.vertexModelLocations,
+	        vertexPublisher: finalConfig.vertexPublisher,
         thinkingBudget: finalConfig.thinkingBudget,
         includeThoughts: finalConfig.includeThoughts,
         includeImageConfig: finalConfig.includeImageConfig,
         includeSafetySettings: finalConfig.includeSafetySettings,
-        safety: finalConfig.safety,
-        imageConfig: finalConfig.imageConfig,
-        webpQuality: finalConfig.webpQuality,
+	        safety: finalConfig.safety,
+	        imageConfig: finalConfig.imageConfig,
+	        novelAiConfig: finalConfig.novelAiConfig,
+	        webpQuality: finalConfig.webpQuality,
         useResponseModalities: finalConfig.useResponseModalities,
         customJson: finalConfig.customJson,
       }];
@@ -261,24 +337,31 @@ export const loadConfig = (): AppConfig => {
   try {
     const data = JSON.parse(raw);
     const baseConfig = { ...DEFAULT_CONFIG, ...data };
-    const apiFormat = coerceApiFormat(baseConfig.apiFormat) as ApiFormat;
-    const storedFormat = formatMap?.[apiFormat];
+	    const rawApiFormat = baseConfig.apiFormat;
+	    const apiFormat = coerceApiFormat(rawApiFormat) as ApiFormat;
+	    const storedFormat =
+	      formatMap?.[apiFormat] ||
+	      (rawApiFormat === 'vertex-express' ? formatMap?.['vertex-express'] : undefined);
     const hasLegacyFormatFields = [
       'apiUrl',
       'apiKey',
       'model',
-      'apiVersion',
-      'openaiEndpointMode',
-      'vertexProjectId',
-      'vertexLocation',
-      'vertexPublisher',
+	      'apiVersion',
+	      'openaiEndpointMode',
+	      'vertexAuthMode',
+	      'vertexProjectId',
+	      'vertexLocation',
+	      'vertexDefaultLocation',
+	      'vertexModelLocations',
+	      'vertexPublisher',
       'thinkingBudget',
       'includeThoughts',
       'includeImageConfig',
       'includeSafetySettings',
-      'safety',
-      'imageConfig',
-      'webpQuality',
+	      'safety',
+	      'imageConfig',
+	      'novelAiConfig',
+	      'webpQuality',
       'useResponseModalities',
       'customJson',
     ].some((key) => Object.prototype.hasOwnProperty.call(data, key));
@@ -291,8 +374,9 @@ export const loadConfig = (): AppConfig => {
       ...DEFAULT_FORMAT_CONFIGS[apiFormat],
       ...fallbackFormat,
     };
-    const finalConfig = { ...baseConfig, ...formatConfig, apiFormat };
-    finalConfig.apiProfiles = normalizeApiProfiles(finalConfig.apiProfiles);
+	    const finalConfig = { ...baseConfig, ...formatConfig, apiFormat };
+	    finalConfig.vertexAuthMode = coerceVertexAuthMode(finalConfig.vertexAuthMode, rawApiFormat);
+	    finalConfig.apiProfiles = normalizeApiProfiles(finalConfig.apiProfiles);
     if (!finalConfig.apiProfiles || finalConfig.apiProfiles.length === 0) {
       finalConfig.apiProfiles = [{
         id: 'default',
@@ -300,19 +384,23 @@ export const loadConfig = (): AppConfig => {
         apiUrl: finalConfig.apiUrl,
         apiKey: finalConfig.apiKey,
         model: finalConfig.model,
-        apiFormat: finalConfig.apiFormat,
-        openaiEndpointMode: finalConfig.openaiEndpointMode,
-        apiVersion: finalConfig.apiVersion,
-        vertexProjectId: finalConfig.vertexProjectId,
-        vertexLocation: finalConfig.vertexLocation,
-        vertexPublisher: finalConfig.vertexPublisher,
+	        apiFormat: finalConfig.apiFormat,
+	        openaiEndpointMode: finalConfig.openaiEndpointMode,
+	        apiVersion: finalConfig.apiVersion,
+	        vertexAuthMode: finalConfig.vertexAuthMode,
+	        vertexProjectId: finalConfig.vertexProjectId,
+	        vertexLocation: finalConfig.vertexLocation,
+	        vertexDefaultLocation: finalConfig.vertexDefaultLocation,
+	        vertexModelLocations: finalConfig.vertexModelLocations,
+	        vertexPublisher: finalConfig.vertexPublisher,
         thinkingBudget: finalConfig.thinkingBudget,
         includeThoughts: finalConfig.includeThoughts,
         includeImageConfig: finalConfig.includeImageConfig,
         includeSafetySettings: finalConfig.includeSafetySettings,
-        safety: finalConfig.safety,
-        imageConfig: finalConfig.imageConfig,
-        webpQuality: finalConfig.webpQuality,
+	        safety: finalConfig.safety,
+	        imageConfig: finalConfig.imageConfig,
+	        novelAiConfig: finalConfig.novelAiConfig,
+	        webpQuality: finalConfig.webpQuality,
         useResponseModalities: finalConfig.useResponseModalities,
         customJson: finalConfig.customJson,
       }];
@@ -387,6 +475,20 @@ export const loadTasks = (): TaskConfig[] => {
 
 export const getTaskStorageKey = (id: string) => `${TASK_STORAGE_PREFIX}${id}`;
 
+export const getWorkflowImageKeys = (workflow: unknown) => {
+  if (!workflow || typeof workflow !== 'object') return [];
+  const nodes = (workflow as { nodes?: unknown }).nodes;
+  if (!Array.isArray(nodes)) return [];
+  return nodes
+    .map((node) => {
+      if (!node || typeof node !== 'object') return '';
+      const metadata = (node as { metadata?: Record<string, unknown> }).metadata;
+      const localKey = typeof metadata?.localKey === 'string' ? metadata.localKey : '';
+      return localKey;
+    })
+    .filter((key): key is string => Boolean(key));
+};
+
 const getTaskImageKeys = (storageKey: string) => {
   const raw = safeStorageGet(storageKey, 'app cache');
   if (!raw) return [];
@@ -394,6 +496,7 @@ const getTaskImageKeys = (storageKey: string) => {
     const data = JSON.parse(raw) as {
       results?: Array<{ id?: string; localKey?: string }>;
       uploads?: Array<{ localKey?: string }>;
+      workflow?: unknown;
     };
     const resultKeys = Array.isArray(data?.results)
       ? data.results
@@ -405,7 +508,7 @@ const getTaskImageKeys = (storageKey: string) => {
           .map((item) => item?.localKey)
           .filter((key): key is string => typeof key === 'string')
       : [];
-    return Array.from(new Set([...resultKeys, ...uploadKeys]));
+    return Array.from(new Set([...resultKeys, ...uploadKeys, ...getWorkflowImageKeys(data.workflow)]));
   } catch (err) {
     console.warn('Failed to parse task cache for cleanup:', err);
     return [];
@@ -481,6 +584,54 @@ export const collectTaskImageKeys = (taskIds: string[]) => {
     getTaskImageKeys(storageKey).forEach((key) => keys.add(key));
   });
   return Array.from(keys);
+};
+
+export const loadWorkflowProjects = (): WorkflowProject[] => {
+  const raw = safeStorageGet(STORAGE_KEYS.workflowProjects, 'workflow cache');
+  if (!raw) return [];
+  try {
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data)) return [];
+    return data.filter((item): item is WorkflowProject =>
+      Boolean(
+        item &&
+          typeof item === 'object' &&
+          typeof item.id === 'string' &&
+          typeof item.title === 'string' &&
+          item.state &&
+          typeof item.state === 'object',
+      ),
+    );
+  } catch (err) {
+    console.warn('Failed to parse workflow cache:', err);
+    return [];
+  }
+};
+
+export const saveWorkflowProjects = (projects: WorkflowProject[]) => {
+  safeStorageSet(STORAGE_KEYS.workflowProjects, JSON.stringify(projects), 'workflow cache');
+};
+
+export const collectWorkflowProjectImageKeys = (projects = loadWorkflowProjects()) => {
+  const keys = new Set<string>();
+  projects.forEach((project) => {
+    getWorkflowImageKeys(project.state).forEach((key) => keys.add(key));
+  });
+  return Array.from(keys);
+};
+
+export const cleanupWorkflowProjectCache = async (
+  project: WorkflowProject,
+  options: CleanupTaskCacheOptions = {},
+) => {
+  const keys = getWorkflowImageKeys(project.state);
+  const preserveSet = options.preserveImageKeys
+    ? new Set(options.preserveImageKeys)
+    : null;
+  const keysToDelete = preserveSet
+    ? keys.filter((key) => !preserveSet.has(key))
+    : keys;
+  await deleteImageBlobs(keysToDelete);
 };
 
 export const cleanupUnusedImageCache = async (keepKeys: Iterable<string>) => {

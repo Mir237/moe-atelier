@@ -7,6 +7,7 @@ interface LazySliderProps {
   min: number;
   max: number;
   step?: number;
+  disabled?: boolean;
 }
 
 const LazySliderInput: React.FC<LazySliderProps> = ({
@@ -15,6 +16,7 @@ const LazySliderInput: React.FC<LazySliderProps> = ({
   min,
   max,
   step = 1,
+  disabled,
 }) => {
   const [localValue, setLocalValue] = useState<number>(value);
 
@@ -23,24 +25,29 @@ const LazySliderInput: React.FC<LazySliderProps> = ({
   }, [value]);
 
   const handleSliderChange = (val: number) => {
+    if (disabled) return;
     setLocalValue(val);
   };
 
   const handleSliderAfterChange = (val: number) => {
+    if (disabled) return;
     onChange?.(val);
   };
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (disabled) return;
     const val = e.target.value;
     if (val === '') return;
-    if (!/^\d+$/.test(val)) return;
-    setLocalValue(Number(val));
+    if (!/^\d+(?:\.\d*)?$/.test(val)) return;
+    const next = Number(val);
+    if (Number.isFinite(next)) setLocalValue(next);
   };
 
   const handleInputBlur = () => {
+    if (disabled) return;
     let constrained = Math.max(min, Math.min(max, localValue));
     if (step) {
-      constrained = Math.round(constrained / step) * step;
+      constrained = Number((Math.round(constrained / step) * step).toFixed(6));
     }
     setLocalValue(constrained);
     onChange?.(constrained);
@@ -52,11 +59,12 @@ const LazySliderInput: React.FC<LazySliderProps> = ({
         <Slider
           min={min}
           max={max}
-          step={step}
-          value={localValue}
-          onChange={handleSliderChange}
-          onAfterChange={handleSliderAfterChange}
-        />
+	          step={step}
+	          value={localValue}
+	          onChange={handleSliderChange}
+	          onAfterChange={handleSliderAfterChange}
+	          disabled={disabled}
+	        />
       </Col>
       <Col span={8}>
         <div
@@ -71,17 +79,19 @@ const LazySliderInput: React.FC<LazySliderProps> = ({
           }}
         >
           <input
-            type="number"
-            value={localValue}
-            onChange={handleInputChange}
-            onBlur={handleInputBlur}
-            style={{
+	            type="number"
+	            value={localValue}
+	            onChange={handleInputChange}
+	            onBlur={handleInputBlur}
+	            disabled={disabled}
+	            style={{
               width: '100%',
               border: 'none',
               textAlign: 'center',
-              color: '#665555',
+	              color: disabled ? '#B8A7A7' : '#665555',
               fontWeight: 700,
-              background: 'transparent',
+	              background: 'transparent',
+	              cursor: disabled ? 'not-allowed' : 'text',
               outline: 'none',
               fontSize: 12,
               padding: 0,

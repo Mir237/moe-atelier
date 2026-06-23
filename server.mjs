@@ -33,13 +33,18 @@ import {
   loadBackendState,
   loadBackendStateSnapshot,
   loadTaskState,
+  loadWorkflowProject,
   normalizeCollectionPayloadForSave,
   normalizeConcurrency,
   normalizeRetryInterval,
   normalizeRetryLimit,
+  normalizeWorkflowState,
+  listWorkflowProjects,
   saveBackendCollection,
   saveBackendState,
   saveTaskState,
+  saveWorkflowProject,
+  deleteWorkflowProject,
 } from './server/storage.mjs'
 import { parseMarkdownImage, resolveImageFromResponse } from './server/imageParser.mjs'
 import { getMimeFromFilename, saveBackendImageBuffer, saveImageBuffer } from './server/imageStore.mjs'
@@ -72,6 +77,9 @@ const collectImageKeysFromTask = (taskState) => {
   const keys = new Set()
   const uploads = Array.isArray(taskState?.uploads) ? taskState.uploads : []
   const results = Array.isArray(taskState?.results) ? taskState.results : []
+  const workflowNodes = Array.isArray(taskState?.workflow?.nodes)
+    ? taskState.workflow.nodes
+    : []
   uploads.forEach((item) => {
     if (!item?.localKey) return
     keys.add(path.basename(item.localKey))
@@ -79,6 +87,13 @@ const collectImageKeysFromTask = (taskState) => {
   results.forEach((item) => {
     if (!item?.localKey) return
     keys.add(path.basename(item.localKey))
+  })
+  workflowNodes.forEach((node) => {
+    const metadata = node?.metadata || {}
+    const localKey = typeof metadata.localKey === 'string' ? metadata.localKey : ''
+    const sourceKey = extractBackendImageKeyFromUrl(metadata.sourceUrl || metadata.content)
+    const key = localKey || sourceKey
+    if (key) keys.add(path.basename(key))
   })
   return keys
 }
@@ -143,6 +158,10 @@ const collectAllReferencedImageKeys = async () => {
   const collectionItems = await loadBackendCollection()
   const collectionKeys = collectImageKeysFromCollection(collectionItems)
   collectionKeys.forEach((key) => keys.add(key))
+  const workflowProjects = await listWorkflowProjects()
+  workflowProjects.forEach((project) => {
+    collectImageKeysFromTask({ workflow: project.state }).forEach((key) => keys.add(key))
+  })
   return keys
 }
 
@@ -287,20 +306,55 @@ const updateGlobalStats = async (type, duration, count) => {
   await saveBackendState({ ...state, globalStats: stats })
 }
 
-const resolveTaskApiConfig = (taskState, backendState, runtimeConfig) => {
+const stripEmptyNovelAiOverrides = (overrides) => {
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return {}
+  return Object.fromEntries(
+    Object.entries(overrides).filter(([key, value]) => {
+      if (value === undefined || value === null) return false
+      if (typeof value === 'string' && value.trim() === '') return false
+      if (key === 'seed' && !Number.isFinite(Number(value))) return false
+      if (typeof value === 'number' && !Number.isFinite(value)) return false
+      return true
+    }),
+  )
+}
+
+const applyNovelAiOverrides = (config, overrides) => {
+  if (coerceProviderApiFormat(config?.apiFormat) !== 'novelai') return config
+  const clean = stripEmptyNovelAiOverrides(overrides)
+  if (Object.keys(clean).length === 0) return config
+  const { uc, ...rest } = clean
+  const baseNovelAiConfig = config.novelAiConfig || {}
+  const joinedUc = [baseNovelAiConfig.uc, uc]
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .join(', ')
+  return {
+    ...config,
+    novelAiConfig: {
+      ...baseNovelAiConfig,
+      ...rest,
+      ...(uc ? { uc: joinedUc } : {}),
+    },
+  }
+}
+
+const resolveTaskApiConfig = (taskState, backendState, runtimeConfig, options = {}) => {
   const baseConfig = runtimeConfig || backendState?.config || {}
   const profiles = Array.isArray(baseConfig.apiProfiles) ? baseConfig.apiProfiles : []
   const taskProfileId = typeof taskState?.apiProfileId === 'string' ? taskState.apiProfileId : ''
   const matchedProfile = taskProfileId
     ? profiles.find((profile) => profile?.id === taskProfileId)
     : null
-  if (!matchedProfile) {
-    return baseConfig
-  }
-  return {
-    ...baseConfig,
-    ...matchedProfile,
-  }
+  const resolved = matchedProfile
+    ? {
+        ...baseConfig,
+        ...matchedProfile,
+      }
+    : baseConfig
+  return options.applyNovelAiOverrides === false
+    ? resolved
+    : applyNovelAiOverrides(resolved, taskState?.novelAiOverrides)
 }
 
 const buildMessagesForTask = async (taskState) => {
@@ -325,6 +379,145 @@ const buildMessagesForTask = async (taskState) => {
     }
   }
   return [{ role: 'user', content }]
+}
+
+const readBackendImageAsDataUrl = async (localKey, mimeType) => {
+  const safeKey = path.basename(String(localKey || ''))
+  if (!safeKey) return ''
+  const filePath = path.join(backendImagesDir, safeKey)
+  const buffer = await fs.promises.readFile(filePath)
+  const resolvedMime = mimeType || getMimeFromFilename(safeKey)
+  return `data:${resolvedMime};base64,${buffer.toString('base64')}`
+}
+
+const resolveWorkflowReferenceDataUrl = async (reference) => {
+  if (!reference || typeof reference !== 'object') return ''
+  const explicitDataUrl =
+    typeof reference.dataUrl === 'string' && reference.dataUrl.startsWith('data:image')
+      ? reference.dataUrl
+      : ''
+  if (explicitDataUrl) return explicitDataUrl
+  const localKey =
+    typeof reference.localKey === 'string' && reference.localKey
+      ? reference.localKey
+      : extractBackendImageKeyFromUrl(reference.sourceUrl)
+  if (!localKey) return ''
+  try {
+    return await readBackendImageAsDataUrl(localKey, reference.type || reference.mimeType)
+  } catch (err) {
+    console.warn('读取工作流参考图失败:', err)
+    return ''
+  }
+}
+
+const buildMessagesForWorkflow = async ({ prompt, referenceImages }) => {
+  const content = []
+  const promptText = typeof prompt === 'string' ? prompt.trim() : ''
+  if (promptText) {
+    content.push({ type: 'text', text: promptText })
+  }
+  const references = Array.isArray(referenceImages) ? referenceImages : []
+  for (const reference of references) {
+    const dataUrl = await resolveWorkflowReferenceDataUrl(reference)
+    if (!dataUrl) continue
+    content.push({ type: 'image_url', image_url: { url: dataUrl } })
+  }
+  return [{ role: 'user', content }]
+}
+
+const normalizeWorkflowCount = (value) => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 1
+  return Math.max(1, Math.min(16, Math.floor(value)))
+}
+
+const normalizeWorkflowGenerationOptions = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const options = {}
+  ;['size', 'aspectRatio', 'quality'].forEach((key) => {
+    const raw = typeof value[key] === 'string' ? value[key].trim() : ''
+    if (raw && raw !== 'auto') options[key] = raw
+  })
+  return options
+}
+
+const applyWorkflowGenerationOptions = (config, options) => {
+  if (typeof options === 'undefined') return config
+  const normalized = normalizeWorkflowGenerationOptions(options)
+  if (!Object.keys(normalized).length) {
+    return {
+      ...config,
+      includeImageConfig: false,
+      imageConfig: {
+        ...(config.imageConfig || {}),
+        imageSize: 'auto',
+        aspectRatio: 'auto',
+      },
+    }
+  }
+  return {
+    ...config,
+    ...(normalized.quality ? { quality: normalized.quality } : {}),
+    includeImageConfig: Boolean(normalized.size || normalized.aspectRatio),
+    imageConfig: {
+      ...(config.imageConfig || {}),
+      imageSize: normalized.size || 'auto',
+      aspectRatio: normalized.aspectRatio || 'auto',
+    },
+  }
+}
+
+const appendOpenAiImageOptions = (target, options = {}) => {
+  const normalized = normalizeWorkflowGenerationOptions(options)
+  const append = (key, value) => {
+    if (!value) return
+    if (target instanceof FormData) target.append(key, value)
+    else target[key] = value
+  }
+  append('size', normalized.size)
+  append('quality', normalized.quality)
+}
+
+const generateWorkflowImages = async ({ apiConfig, prompt, referenceImages, count, generationOptions }) => {
+  const messages = await buildMessagesForWorkflow({
+    prompt,
+    referenceImages,
+  })
+  const normalizedGenerationOptions = normalizeWorkflowGenerationOptions(generationOptions)
+  const requestConfig = applyWorkflowGenerationOptions(apiConfig, normalizedGenerationOptions)
+  await updateGlobalStats('request', undefined, count)
+  const images = []
+  for (let index = 0; index < count; index += 1) {
+    const startTime = Date.now()
+    try {
+      const imageUrl = await requestImageUrl(requestConfig, messages, undefined, normalizedGenerationOptions)
+      if (!imageUrl) {
+        throw new Error('未在响应中找到图片数据')
+      }
+      const downloaded = await downloadImageBuffer(imageUrl)
+      if (!downloaded) {
+        throw new Error('图片下载失败')
+      }
+      const saved = await saveBackendImageBuffer(downloaded.buffer, downloaded.contentType)
+      const duration = Date.now() - startTime
+      await updateGlobalStats('success', duration)
+      images.push({
+        status: 'success',
+        localKey: saved.fileName,
+        sourceUrl: `/api/backend/image/${encodeURIComponent(saved.fileName)}`,
+        mimeType: downloaded.contentType,
+        bytes: downloaded.buffer.length,
+        duration,
+      })
+    } catch (err) {
+      images.push({
+        status: 'error',
+        error: err?.message || '生成失败',
+        duration: Date.now() - startTime,
+      })
+    }
+  }
+  scheduleOrphanCleanup()
+  return images
 }
 
 const buildGeminiContentsFromMessages = (messages = []) => {
@@ -538,7 +731,7 @@ const extractOpenAiImagesPayload = (messages = []) => {
   }
 }
 
-const requestOpenAiImageEndpoint = async (config, messages, openAiBase, signal) => {
+const requestOpenAiImageEndpoint = async (config, messages, openAiBase, signal, generationOptions) => {
   const { prompt, images } = extractOpenAiImagesPayload(messages)
   const hasReferenceImages = images.length > 0
   const url = buildOpenAiImagesUrl(openAiBase, hasReferenceImages)
@@ -567,10 +760,13 @@ const requestOpenAiImageEndpoint = async (config, messages, openAiBase, signal) 
         `image-${index + 1}${imageExtensionFromMime(contentType)}`,
       )
     })
+    appendOpenAiImageOptions(formData, generationOptions)
     body = formData
   } else {
     headers['Content-Type'] = 'application/json'
-    body = JSON.stringify({ model: config.model, prompt })
+    const payload = { model: config.model, prompt }
+    appendOpenAiImageOptions(payload, generationOptions)
+    body = JSON.stringify(payload)
   }
 
   logBackendOutbound('api-request', requestInfo)
@@ -648,7 +844,7 @@ const requestNovelAiImageEndpoint = async (config, messages, signal) => {
   return image?.dataUrl || null
 }
 
-const requestImageUrl = async (config, messages, signal) => {
+const requestImageUrl = async (config, messages, signal, generationOptions) => {
   if (!config?.apiKey) {
     throw new Error('API Key 未配置')
   }
@@ -669,11 +865,14 @@ const requestImageUrl = async (config, messages, signal) => {
     let data
     try {
       const contents = buildGeminiContentsFromMessages(messages)
-      const built = buildGoogleGenerateRequest(
+      const built = await buildGoogleGenerateRequest(
         { ...config, apiFormat },
         { stream: Boolean(config.stream) },
       )
-      const payload = buildGeminiPayload(contents, config)
+      const payload = buildGeminiPayload(
+        contents,
+        applyWorkflowGenerationOptions(config, generationOptions),
+      )
       requestInfo.url = built.url
       logBackendOutbound('api-request', requestInfo)
       response = await fetch(built.url, {
@@ -705,13 +904,17 @@ const requestImageUrl = async (config, messages, signal) => {
   }
 
   if (apiFormat === 'novelai') {
-    return requestNovelAiImageEndpoint(config, messages, signal)
+    return requestNovelAiImageEndpoint(
+      applyWorkflowGenerationOptions(config, generationOptions),
+      messages,
+      signal,
+    )
   }
 
   const apiUrl = resolveApiUrl(config?.apiUrl, 'openai')
   const openAiBase = buildOpenAiBaseUrl(apiUrl, config.apiVersion)
   if (config.openaiEndpointMode === 'images') {
-    return requestOpenAiImageEndpoint(config, messages, openAiBase, signal)
+    return requestOpenAiImageEndpoint(config, messages, openAiBase, signal, generationOptions)
   }
   const chatUrl = buildOpenAiChatUrl(openAiBase)
   const headers = {
@@ -1404,6 +1607,7 @@ app.put('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
       stats: { ...DEFAULT_TASK_STATS, ...(payload?.stats || {}) },
       results: Array.isArray(payload?.results) ? payload.results : [],
       uploads: Array.isArray(payload?.uploads) ? payload.uploads : [],
+      workflow: normalizeWorkflowState(payload?.workflow),
     }
     await saveTaskState(req.params.id, next)
     if (previous) {
@@ -1427,10 +1631,18 @@ app.patch('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
       prompt: typeof payload.prompt === 'string' ? payload.prompt : current.prompt,
       concurrency: normalizeConcurrency(payload?.concurrency, current.concurrency || DEFAULT_CONCURRENCY),
       enableSound: typeof payload.enableSound === 'boolean' ? payload.enableSound : current.enableSound,
-      retryInterval: normalizeRetryInterval(payload?.retryInterval, current.retryInterval),
-      retryLimit: normalizeRetryLimit(payload?.retryLimit, current.retryLimit),
-      apiProfileId: typeof payload.apiProfileId === 'string' ? payload.apiProfileId : current.apiProfileId,
-      uploads: Array.isArray(payload?.uploads) ? payload.uploads : current.uploads,
+	      retryInterval: normalizeRetryInterval(payload?.retryInterval, current.retryInterval),
+	      retryLimit: normalizeRetryLimit(payload?.retryLimit, current.retryLimit),
+	      apiProfileId: typeof payload.apiProfileId === 'string' ? payload.apiProfileId : current.apiProfileId,
+	      novelAiOverrides: Object.prototype.hasOwnProperty.call(payload, 'novelAiOverrides')
+	        ? stripEmptyNovelAiOverrides(payload.novelAiOverrides)
+	        : current.novelAiOverrides,
+	      uploads: Array.isArray(payload?.uploads) ? payload.uploads : current.uploads,
+      results: Array.isArray(payload?.results) ? payload.results : current.results,
+      stats: payload?.stats ? { ...DEFAULT_TASK_STATS, ...payload.stats } : current.stats,
+      workflow: Object.prototype.hasOwnProperty.call(payload, 'workflow')
+        ? normalizeWorkflowState(payload.workflow)
+        : current.workflow,
     }
     await saveTaskState(req.params.id, next)
     const removedKeys = getRemovedImageKeys(current, next)
@@ -1440,6 +1652,184 @@ app.patch('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
   } catch (err) {
     console.error('backend task patch error:', err)
     res.status(500).json({ error: 'Write Error' })
+  }
+})
+
+const findWorkflowTaskLinkConflict = async (linkedTaskId, currentWorkflowId = '') => {
+  if (typeof linkedTaskId !== 'string' || !linkedTaskId) return null
+  const projects = await listWorkflowProjects()
+  return projects.find(
+    (project) => project.linkedTaskId === linkedTaskId && project.id !== currentWorkflowId,
+  ) || null
+}
+
+const sendWorkflowTaskLinkConflict = (res, project) => {
+  res.status(409).json({
+    error: 'Task Already Linked',
+    workflowId: project.id,
+    workflowTitle: project.title,
+  })
+}
+
+app.get('/api/backend/workflows', requireBackendAuth, async (_req, res) => {
+  try {
+    res.json(await listWorkflowProjects())
+  } catch (err) {
+    console.error('backend workflows list error:', err)
+    res.status(500).json({ error: 'Read Error' })
+  }
+})
+
+app.post('/api/backend/workflows', requireBackendAuth, async (req, res) => {
+  try {
+    const now = new Date().toISOString()
+    const id = typeof req.body?.id === 'string' && req.body.id ? req.body.id : crypto.randomUUID()
+    const linkedTaskId = typeof req.body?.linkedTaskId === 'string' ? req.body.linkedTaskId : undefined
+    const conflict = await findWorkflowTaskLinkConflict(linkedTaskId, id)
+    if (conflict) {
+      sendWorkflowTaskLinkConflict(res, conflict)
+      return
+    }
+    const project = await saveWorkflowProject(id, {
+      id,
+      title: typeof req.body?.title === 'string' ? req.body.title : '未命名画布',
+      linkedTaskId,
+      createdAt: now,
+      updatedAt: now,
+      state: normalizeWorkflowState(req.body?.state),
+    })
+    res.json(project)
+  } catch (err) {
+    console.error('backend workflow create error:', err)
+    res.status(500).json({ error: 'Write Error' })
+  }
+})
+
+app.get('/api/backend/workflow/:id', requireBackendAuth, async (req, res) => {
+  try {
+    const project = await loadWorkflowProject(req.params.id)
+    if (!project) {
+      res.status(404).json({ error: 'Not Found' })
+      return
+    }
+    res.json(project)
+  } catch (err) {
+    console.error('backend workflow read error:', err)
+    res.status(500).json({ error: 'Read Error' })
+  }
+})
+
+app.patch('/api/backend/workflow/:id', requireBackendAuth, async (req, res) => {
+  try {
+    const current = await loadWorkflowProject(req.params.id)
+    if (!current) {
+      res.status(404).json({ error: 'Not Found' })
+      return
+    }
+    const payload = req.body || {}
+    const nextLinkedTaskId = Object.prototype.hasOwnProperty.call(payload, 'linkedTaskId')
+      ? (typeof payload.linkedTaskId === 'string' && payload.linkedTaskId ? payload.linkedTaskId : undefined)
+      : current.linkedTaskId
+    const conflict = await findWorkflowTaskLinkConflict(nextLinkedTaskId, current.id)
+    if (conflict) {
+      sendWorkflowTaskLinkConflict(res, conflict)
+      return
+    }
+    const patch = {
+      ...current,
+      title: typeof payload.title === 'string' ? payload.title : current.title,
+      linkedTaskId: nextLinkedTaskId,
+      state: Object.prototype.hasOwnProperty.call(payload, 'state')
+        ? normalizeWorkflowState(payload.state)
+        : current.state,
+    }
+    res.json(await saveWorkflowProject(req.params.id, patch))
+  } catch (err) {
+    console.error('backend workflow patch error:', err)
+    res.status(500).json({ error: 'Write Error' })
+  }
+})
+
+app.delete('/api/backend/workflow/:id', requireBackendAuth, async (req, res) => {
+  try {
+    const current = await loadWorkflowProject(req.params.id)
+    if (current) {
+      await deleteWorkflowProject(req.params.id)
+      await cleanupUnusedImages(getRemovedImageKeys({ workflow: current.state }, { workflow: undefined }))
+    }
+    scheduleOrphanCleanup()
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('backend workflow delete error:', err)
+    res.status(500).json({ error: 'Delete Error' })
+  }
+})
+
+app.post('/api/backend/workflow/:id/generate', requireBackendAuth, async (req, res) => {
+  try {
+    const body = req.body || {}
+    const count = normalizeWorkflowCount(body.count)
+    const prompt = typeof body.prompt === 'string' ? body.prompt : ''
+    if (!prompt.trim() && !Array.isArray(body.referenceImages)) {
+      res.status(400).json({ error: 'Missing prompt or referenceImages' })
+      return
+    }
+    const backendState = await loadBackendState()
+	    const apiConfig = resolveTaskApiConfig(
+	      {
+	        apiProfileId:
+	          typeof body.apiProfileId === 'string' ? body.apiProfileId : backendState.config?.activeApiProfileId,
+	      },
+	      backendState,
+	      body.runtimeConfig,
+	      { applyNovelAiOverrides: false },
+	    )
+    const images = await generateWorkflowImages({
+      apiConfig,
+      prompt,
+      referenceImages: body.referenceImages,
+      count,
+      generationOptions: body.generationOptions,
+    })
+    res.json({ images })
+  } catch (err) {
+    console.error('backend workflow generate error:', err)
+    res.status(500).json({ error: err?.message || 'Workflow Generate Error' })
+  }
+})
+
+app.post('/api/backend/task/:id/workflow/generate', requireBackendAuth, async (req, res) => {
+  try {
+    const body = req.body || {}
+    const count = normalizeWorkflowCount(body.count)
+    const prompt = typeof body.prompt === 'string' ? body.prompt : ''
+    if (!prompt.trim() && !Array.isArray(body.referenceImages)) {
+      res.status(400).json({ error: 'Missing prompt or referenceImages' })
+      return
+    }
+    const taskState = (await loadTaskState(req.params.id)) || createDefaultTaskState()
+    const backendState = await loadBackendState()
+	    const taskApiConfig = resolveTaskApiConfig(
+	      {
+	        ...taskState,
+	        apiProfileId:
+	          typeof body.apiProfileId === 'string' ? body.apiProfileId : taskState.apiProfileId,
+	      },
+	      backendState,
+	      body.runtimeConfig,
+	      { applyNovelAiOverrides: false },
+	    )
+    const images = await generateWorkflowImages({
+        apiConfig: taskApiConfig,
+        prompt,
+        referenceImages: body.referenceImages,
+        count,
+        generationOptions: body.generationOptions,
+      })
+    res.json({ images })
+  } catch (err) {
+    console.error('backend task workflow generate error:', err)
+    res.status(500).json({ error: err?.message || 'Workflow Generate Error' })
   }
 })
 

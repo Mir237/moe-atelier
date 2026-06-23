@@ -1,4 +1,6 @@
 import type { TaskStats } from './stats';
+import type { WorkflowState } from './workflow';
+import type { NovelAiOverrides } from './app';
 
 export interface SubTaskResult {
   id: string;
@@ -13,6 +15,8 @@ export interface SubTaskResult {
   startTime?: number;
   endTime?: number;
   duration?: number;
+  workflowProjectId?: string;
+  workflowNodeId?: string;
 }
 
 export interface PersistedSubTaskResult {
@@ -27,6 +31,8 @@ export interface PersistedSubTaskResult {
   localKey?: string;
   sourceUrl?: string;
   savedLocal?: boolean;
+  workflowProjectId?: string;
+  workflowNodeId?: string;
 }
 
 export interface PersistedUploadImage {
@@ -38,6 +44,8 @@ export interface PersistedUploadImage {
   localKey: string;
   fromCollection?: boolean;
   sourceSignature?: string;
+  workflowProjectId?: string;
+  workflowNodeId?: string;
 }
 
 export interface PersistedImageTaskState {
@@ -51,4 +59,6 @@ export interface PersistedImageTaskState {
   uploads?: PersistedUploadImage[];
   stats: TaskStats;
   apiProfileId?: string;
+  novelAiOverrides?: NovelAiOverrides;
+  workflow?: WorkflowState;
 }

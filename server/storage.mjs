@@ -5,6 +5,7 @@ import {
   backendCollectionPath,
   backendStatePath,
   backendTasksDir,
+  backendWorkflowsDir,
   coerceApiFormat,
   DEFAULT_BACKEND_CONFIG,
   DEFAULT_CONCURRENCY,
@@ -95,6 +96,149 @@ const writeJsonFileAtomic = async (filePath, data) => {
 }
 
 const coerceString = (value) => (typeof value === 'string' ? value : '')
+const coerceFiniteNumber = (value, fallback) =>
+  typeof value === 'number' && Number.isFinite(value) ? value : fallback
+
+const WORKFLOW_NODE_TYPES = new Set(['text', 'image', 'config'])
+const WORKFLOW_STATUSES = new Set(['idle', 'loading', 'success', 'error'])
+const WORKFLOW_BACKGROUNDS = new Set(['dots', 'lines', 'blank'])
+
+const normalizeNovelAiOverrides = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const next = {}
+  Object.entries(value).forEach(([key, rawValue]) => {
+    if (rawValue === undefined || rawValue === null) return
+    if (typeof rawValue === 'string' && rawValue.trim() === '') return
+    if (key === 'seed' && !Number.isFinite(Number(rawValue))) return
+    if (typeof rawValue === 'number' && !Number.isFinite(rawValue)) return
+    next[key] = rawValue
+  })
+  return Object.keys(next).length > 0 ? next : undefined
+}
+
+const normalizeWorkflowMetadata = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const raw = value
+  const metadata = {}
+  ;[
+    'content',
+    'composerContent',
+    'prompt',
+    'errorDetails',
+    'apiProfileId',
+    'model',
+    'size',
+    'aspectRatio',
+    'quality',
+    'generationType',
+    'localKey',
+    'sourceUrl',
+    'mimeType',
+    'uploadName',
+  ].forEach((key) => {
+    if (typeof raw[key] === 'string') metadata[key] = raw[key]
+  })
+  if (WORKFLOW_STATUSES.has(raw.status)) metadata.status = raw.status
+	if (typeof raw.count === 'number' && Number.isFinite(raw.count)) {
+	  metadata.count = Math.max(1, Math.min(16, Math.floor(raw.count)))
+	}
+	if (typeof raw.settingsVersion === 'number' && Number.isFinite(raw.settingsVersion)) {
+	  metadata.settingsVersion = Math.max(1, Math.floor(raw.settingsVersion))
+	}
+	if (typeof raw.settingsTouched === 'boolean') {
+	  metadata.settingsTouched = raw.settingsTouched
+	}
+	;['naturalWidth', 'naturalHeight', 'bytes'].forEach((key) => {
+    if (typeof raw[key] === 'number' && Number.isFinite(raw[key])) metadata[key] = raw[key]
+  })
+	  if (Array.isArray(raw.references)) {
+	    metadata.references = raw.references.filter((item) => typeof item === 'string')
+	  }
+  const novelAiOverrides = normalizeNovelAiOverrides(raw.novelAiOverrides)
+  if (novelAiOverrides) metadata.novelAiOverrides = novelAiOverrides
+	  return metadata
+	}
+
+export const normalizeWorkflowState = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const raw = value
+  const nodes = Array.isArray(raw.nodes)
+    ? raw.nodes
+        .map((node) => {
+          if (!node || typeof node !== 'object') return null
+          const id = coerceString(node.id)
+          const type = coerceString(node.type)
+          if (!id || !WORKFLOW_NODE_TYPES.has(type)) return null
+          const position = node.position && typeof node.position === 'object' ? node.position : {}
+          return {
+            id,
+            type,
+            title: coerceString(node.title) || (type === 'config' ? '生成配置' : type === 'text' ? '提示词' : '图片'),
+            position: {
+              x: coerceFiniteNumber(position.x, 0),
+              y: coerceFiniteNumber(position.y, 0),
+            },
+            width: Math.max(160, coerceFiniteNumber(node.width, type === 'config' ? 340 : 320)),
+            height: Math.max(120, coerceFiniteNumber(node.height, type === 'text' ? 220 : 240)),
+            metadata: normalizeWorkflowMetadata(node.metadata),
+          }
+        })
+        .filter(Boolean)
+    : []
+  const nodeIds = new Set(nodes.map((node) => node.id))
+  const connections = Array.isArray(raw.connections)
+    ? raw.connections
+        .map((connection) => {
+          if (!connection || typeof connection !== 'object') return null
+          const id = coerceString(connection.id)
+          const fromNodeId = coerceString(connection.fromNodeId)
+          const toNodeId = coerceString(connection.toNodeId)
+          if (!id || !nodeIds.has(fromNodeId) || !nodeIds.has(toNodeId)) return null
+          return { id, fromNodeId, toNodeId }
+        })
+        .filter(Boolean)
+    : []
+  const viewport = raw.viewport && typeof raw.viewport === 'object' ? raw.viewport : {}
+  return {
+    nodes,
+    connections,
+    viewport: {
+      x: coerceFiniteNumber(viewport.x, 0),
+      y: coerceFiniteNumber(viewport.y, 0),
+      k: Math.min(5, Math.max(0.05, coerceFiniteNumber(viewport.k, 1))),
+    },
+    backgroundMode: WORKFLOW_BACKGROUNDS.has(raw.backgroundMode) ? raw.backgroundMode : 'dots',
+    showImageInfo: typeof raw.showImageInfo === 'boolean' ? raw.showImageInfo : false,
+    primaryConfigNodeId: typeof raw.primaryConfigNodeId === 'string' ? raw.primaryConfigNodeId : undefined,
+  }
+}
+
+const workflowProjectPath = (id) => path.join(backendWorkflowsDir, `${id}.json`)
+
+const sanitizeWorkflowProject = (value, fallback = {}) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const now = new Date().toISOString()
+  const id = coerceString(value.id) || fallback.id || crypto.randomUUID()
+  const title = coerceString(value.title) || fallback.title || '未命名画布'
+  const createdAt = coerceString(value.createdAt) || fallback.createdAt || now
+  const updatedAt = coerceString(value.updatedAt) || fallback.updatedAt || now
+  const state = normalizeWorkflowState(value.state) || normalizeWorkflowState(fallback.state) || {
+    nodes: [],
+    connections: [],
+    viewport: { x: 0, y: 0, k: 1 },
+    backgroundMode: 'dots',
+    showImageInfo: false,
+  }
+  const linkedTaskId = coerceString(value.linkedTaskId)
+  return {
+    id,
+    title,
+    ...(linkedTaskId ? { linkedTaskId } : {}),
+    createdAt,
+    updatedAt,
+    state,
+  }
+}
 
 const stripBackendTokenFromUrl = (value = '') => {
   if (!value.includes('/api/backend/image/')) return value
@@ -175,8 +319,9 @@ export const createDefaultTaskState = () => ({
   concurrency: DEFAULT_CONCURRENCY,
   enableSound: true,
   retryInterval: DEFAULT_TASK_RETRY_INTERVAL,
-  retryLimit: DEFAULT_TASK_RETRY_LIMIT,
-  results: [],
+	  retryLimit: DEFAULT_TASK_RETRY_LIMIT,
+	  novelAiOverrides: {},
+	  results: [],
   uploads: [],
   stats: { ...DEFAULT_TASK_STATS },
 })
@@ -188,8 +333,13 @@ const normalizeBackendState = (data) => {
     rawFormatMap && typeof rawFormatMap === 'object' && !Array.isArray(rawFormatMap)
       ? { ...rawFormatMap }
       : {}
-  const apiFormat = coerceApiFormat(config.apiFormat)
+  const rawApiFormat = config.apiFormat
+  const apiFormat = coerceApiFormat(rawApiFormat)
   config.apiFormat = apiFormat
+  if (rawApiFormat === 'vertex-express') config.vertexAuthMode = 'apiKey'
+  if (!configByFormat[apiFormat] && rawApiFormat === 'vertex-express' && configByFormat['vertex-express']) {
+    configByFormat[apiFormat] = { ...configByFormat['vertex-express'], vertexAuthMode: 'apiKey' }
+  }
   if (!configByFormat[apiFormat]) {
     configByFormat[apiFormat] = pickFormatConfig(config)
   }
@@ -246,12 +396,55 @@ export const loadTaskState = async (taskId) => {
     stats: { ...DEFAULT_TASK_STATS, ...(data?.stats || {}) },
     results: Array.isArray(data?.results) ? data.results : [],
     uploads: Array.isArray(data?.uploads) ? data.uploads : [],
+    workflow: normalizeWorkflowState(data?.workflow),
   }
 }
 
 export const saveTaskState = async (taskId, state) => {
   await writeJsonFileAtomic(getTaskFilePath(taskId), state)
   broadcastSseEvent('task', { taskId, state })
+}
+
+export const listWorkflowProjects = async () => {
+  await fs.promises.mkdir(backendWorkflowsDir, { recursive: true })
+  const entries = await fs.promises.readdir(backendWorkflowsDir, { withFileTypes: true })
+  const projects = []
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue
+    const data = await readJsonFile(path.join(backendWorkflowsDir, entry.name), null)
+    const project = sanitizeWorkflowProject(data, { id: entry.name.replace(/\.json$/i, '') })
+    if (project) projects.push(project)
+  }
+  return projects.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
+}
+
+export const loadWorkflowProject = async (id) => {
+  const data = await readJsonFile(workflowProjectPath(id), null)
+  return sanitizeWorkflowProject(data, { id })
+}
+
+export const saveWorkflowProject = async (id, project) => {
+  const current = await loadWorkflowProject(id)
+  const next = sanitizeWorkflowProject(
+    {
+      ...(current || {}),
+      ...project,
+      id,
+      updatedAt: new Date().toISOString(),
+    },
+    { id },
+  )
+  await writeJsonFileAtomic(workflowProjectPath(id), next)
+  broadcastSseEvent('workflow', { projectId: id, project: next })
+  return next
+}
+
+export const deleteWorkflowProject = async (id) => {
+  await fs.promises.unlink(workflowProjectPath(id)).catch((err) => {
+    if (!err || err.code === 'ENOENT') return
+    throw err
+  })
+  broadcastSseEvent('workflow', { projectId: id, deleted: true })
 }
 
 export const normalizeCollectionPayloadForSave = normalizeCollectionPayload

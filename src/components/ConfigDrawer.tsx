@@ -36,8 +36,13 @@ import type { FormInstance } from 'antd/es/form';
 import type { AppConfig } from '../types/app';
 import type { ApiFormat } from '../utils/apiUrl';
 import { API_VERSION_OPTIONS, DEFAULT_API_BASES } from '../utils/apiUrl';
-import { ASPECT_RATIO_OPTIONS, IMAGE_SIZE_OPTIONS, SAFETY_OPTIONS } from '../app/constants';
+import {
+  ASPECT_RATIO_OPTIONS,
+  IMAGE_SIZE_OPTIONS,
+  SAFETY_OPTIONS,
+} from '../app/constants';
 import LazySliderInput from '../shared/ui/LazySliderInput';
+import NovelAiParameterPanel from './NovelAiParameterPanel';
 
 const { Text } = Typography;
 
@@ -93,8 +98,8 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
   const [editingProfileId, setEditingProfileId] = React.useState<string | null>(null);
   const [editingProfileName, setEditingProfileName] = React.useState<string>('');
 
-  const activeProfileId = config.activeApiProfileId || 'default';
-  const profiles = config.apiProfiles || [];
+	  const activeProfileId = config.activeApiProfileId || 'default';
+	  const profiles = config.apiProfiles || [];
 
   const handleAddProfile = () => {
     const { apiProfiles, activeApiProfileId, stream, enableCollection, ...profileFields } = config as any;
@@ -134,13 +139,12 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
     onApiProfileChange(value);
   };
 
-  const apiFormatOptions: Array<{ label: string; value: ApiFormat }> = [
-    { label: 'OpenAI', value: 'openai' },
-    { label: 'Gemini', value: 'gemini' },
-    { label: 'Vertex AI', value: 'vertex' },
-    { label: 'Vertex AI Express', value: 'vertex-express' },
-    { label: 'NovelAI', value: 'novelai' },
-  ];
+	  const apiFormatOptions: Array<{ label: string; value: ApiFormat }> = [
+	    { label: 'OpenAI', value: 'openai' },
+	    { label: 'Gemini', value: 'gemini' },
+	    { label: 'Vertex AI', value: 'vertex' },
+	    { label: 'NovelAI', value: 'novelai' },
+	  ];
 
   return (
   <Drawer
@@ -241,12 +245,13 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
         }}
       </Form.Item>
 
-      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat}>
-        {({ getFieldValue }) => {
-          const apiFormat = getFieldValue('apiFormat') || 'openai';
-          if (apiFormat === 'openai' || apiFormat === 'novelai') {
-            return null;
-          }
+	      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat || prev.vertexAuthMode !== cur.vertexAuthMode}>
+	        {({ getFieldValue }) => {
+	          const apiFormat = getFieldValue('apiFormat') || 'openai';
+	          const vertexAuthMode = getFieldValue('vertexAuthMode') || 'json';
+	          if (apiFormat === 'openai' || apiFormat === 'novelai' || (apiFormat === 'vertex' && vertexAuthMode === 'apiKey')) {
+	            return null;
+	          }
           return (
             <Form.Item label={<span style={{ fontWeight: 700, color: '#665555' }}>API 版本</span>}>
               <Form.Item name="apiVersion" noStyle>
@@ -279,32 +284,79 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
         }}
       </Form.Item>
 
-      <Form.Item name="apiKey" label={<span style={{ fontWeight: 700, color: '#665555' }}>API 密钥</span>}>
-        <Input.Password size="large" placeholder="sk-..." prefix={<SafetyCertificateFilled style={{ color: '#FF9EB5' }} />} />
-      </Form.Item>
+	      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat || prev.vertexAuthMode !== cur.vertexAuthMode}>
+	        {({ getFieldValue }) => {
+	          const apiFormat = getFieldValue('apiFormat') || 'openai';
+	          const vertexAuthMode = getFieldValue('vertexAuthMode') || 'json';
+	          if (apiFormat === 'vertex' && vertexAuthMode === 'json') {
+	            return (
+	              <Form.Item name="apiKey" label={<span style={{ fontWeight: 700, color: '#665555' }}>服务账号 JSON</span>}>
+	                <Input.TextArea rows={5} placeholder="粘贴 Google Cloud 服务账号 JSON" />
+	              </Form.Item>
+	            );
+	          }
+	          return (
+	            <Form.Item name="apiKey" label={<span style={{ fontWeight: 700, color: '#665555' }}>API Key</span>}>
+	              <Input.Password size="large" placeholder="请输入密钥" prefix={<SafetyCertificateFilled style={{ color: '#FF9EB5' }} />} />
+	            </Form.Item>
+	          );
+	        }}
+	      </Form.Item>
 
-      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat}>
-        {({ getFieldValue }) => {
-          const apiFormat = getFieldValue('apiFormat') || 'openai';
-          if (apiFormat !== 'vertex' && apiFormat !== 'vertex-express') {
-            return null;
-          }
-          return (
-            <>
-              {apiFormat === 'vertex' && (
-                <>
-                  <Form.Item name="vertexProjectId" label={<span style={{ fontWeight: 700, color: '#665555' }}>Vertex Project ID</span>}>
-                    <Input size="large" placeholder="my-project-id" />
-                  </Form.Item>
-                  <Form.Item name="vertexLocation" label={<span style={{ fontWeight: 700, color: '#665555' }}>Vertex Location</span>}>
-                    <Input size="large" placeholder="us-central1" />
-                  </Form.Item>
-                </>
-              )}
-              <Form.Item name="vertexPublisher" label={<span style={{ fontWeight: 700, color: '#665555' }}>Vertex Publisher</span>}>
-                <Input size="large" placeholder="google" />
-              </Form.Item>
-            </>
+	      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat}>
+	        {({ getFieldValue }) => {
+	          const apiFormat = getFieldValue('apiFormat') || 'openai';
+	          if (apiFormat !== 'vertex') {
+	            return null;
+	          }
+	          return (
+	            <>
+	              <Form.Item name="vertexAuthMode" label={<span style={{ fontWeight: 700, color: '#665555' }}>密钥格式</span>}>
+	                <Radio.Group optionType="button" buttonStyle="solid">
+	                  <Radio.Button value="json">JSON</Radio.Button>
+	                  <Radio.Button value="apiKey">API Key</Radio.Button>
+	                </Radio.Group>
+	              </Form.Item>
+	              <Form.Item noStyle shouldUpdate={(prev, cur) => prev.vertexAuthMode !== cur.vertexAuthMode}>
+	                {({ getFieldValue: getVertexField }) => {
+	                  const vertexAuthMode = getVertexField('vertexAuthMode') || 'json';
+	                  if (vertexAuthMode !== 'json') return null;
+	                  return (
+	                    <Form.Item name="vertexProjectId" label={<span style={{ fontWeight: 700, color: '#665555' }}>项目 ID</span>}>
+	                      <Input size="large" placeholder="留空时读取服务账号 JSON 中的 project_id" />
+	                    </Form.Item>
+	                  );
+	                }}
+	              </Form.Item>
+	              <Form.Item name="vertexDefaultLocation" label={<span style={{ fontWeight: 700, color: '#665555' }}>部署地区</span>}>
+	                <Input size="large" placeholder="默认使用 us-central1，可填 global / us-central1 等" />
+	              </Form.Item>
+	              <Form.Item label={<span style={{ fontWeight: 700, color: '#665555' }}>模型专用地区</span>}>
+	                <Form.List name="vertexModelLocations">
+	                  {(fields, { add, remove }) => (
+	                    <Space direction="vertical" style={{ width: '100%' }}>
+	                      {fields.map((field) => (
+	                        <Space.Compact key={field.key} style={{ width: '100%' }}>
+	                          <Form.Item name={[field.name, 'model']} noStyle>
+	                            <Input placeholder="模型名，如 gemini-2.5-flash" />
+	                          </Form.Item>
+	                          <Form.Item name={[field.name, 'location']} noStyle>
+	                            <Input placeholder="地区，如 us-central1" />
+	                          </Form.Item>
+	                          <Button icon={<DeleteOutlined />} onClick={() => remove(field.name)} />
+	                        </Space.Compact>
+	                      ))}
+	                      <Button icon={<PlusOutlined />} onClick={() => add({ model: '', location: '' })}>
+	                        添加模型地区
+	                      </Button>
+	                    </Space>
+	                  )}
+	                </Form.List>
+	              </Form.Item>
+	              <Form.Item name="vertexPublisher" label={<span style={{ fontWeight: 700, color: '#665555' }}>发布方</span>}>
+	                <Input size="large" placeholder="google" />
+	              </Form.Item>
+	            </>
           );
         }}
       </Form.Item>
@@ -370,12 +422,12 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
         </Form.Item>
       </div>
 
-      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat}>
-        {({ getFieldValue }) => {
-          const apiFormat = getFieldValue('apiFormat') || 'openai';
-          if (apiFormat === 'openai') {
-            return null;
-          }
+	      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat}>
+	        {({ getFieldValue }) => {
+	          const apiFormat = getFieldValue('apiFormat') || 'openai';
+	          if (apiFormat !== 'gemini' && apiFormat !== 'vertex') {
+	            return null;
+	          }
           return (
             <Collapse
               ghost
@@ -514,13 +566,13 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
 
                       <Divider style={{ margin: '12px 0' }} />
 
-                      <Text style={{ fontWeight: 600, color: '#8B5E34', display: 'block', marginBottom: 8 }}>自定义 JSON</Text>
-                      <Form.Item
-                        name="customJson"
-                        extra="将合并到请求体中（仅 Gemini / Vertex）"
-                        style={{ marginBottom: 0 }}
-                      >
-                        <Input.TextArea rows={4} placeholder='{"generationConfig": {"topK": 40}}' />
+	                      <Text style={{ fontWeight: 600, color: '#8B5E34', display: 'block', marginBottom: 8 }}>自定义 JSON</Text>
+	                      <Form.Item
+	                        name="customJson"
+	                        extra="将合并到 Gemini / Vertex 请求体中"
+	                        style={{ marginBottom: 0 }}
+	                      >
+	                        <Input.TextArea rows={4} placeholder='{"generationConfig": {"topK": 40}}' />
                       </Form.Item>
                     </div>
                   ),
@@ -528,8 +580,61 @@ const ConfigDrawer: React.FC<ConfigDrawerProps> = ({
               ]}
             />
           );
-        }}
-      </Form.Item>
+	        }}
+	      </Form.Item>
+
+	      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.apiFormat !== cur.apiFormat}>
+	        {({ getFieldValue }) => {
+	          const apiFormat = getFieldValue('apiFormat') || 'openai';
+	          if (apiFormat !== 'novelai') {
+	            return null;
+	          }
+	          return (
+	            <Collapse
+	              ghost
+	              items={[
+	                {
+	                  key: 'novelai',
+	                  label: <span style={{ fontWeight: 700, color: '#8B5E34' }}>NovelAI 参数</span>,
+	                  style: { background: '#FFF7E6', borderRadius: 16, border: '1px dashed #FFD591', marginBottom: 24 },
+		                  children: (
+		                    <div>
+		                      <Form.Item noStyle shouldUpdate={(prev, cur) => prev.novelAiConfig !== cur.novelAiConfig}>
+		                        {({ getFieldValue }) => {
+		                          const novelAiConfig = getFieldValue('novelAiConfig') || config.novelAiConfig;
+		                          return (
+		                            <NovelAiParameterPanel
+		                              value={novelAiConfig}
+		                              onChange={(next) => {
+		                                form.setFieldsValue({ novelAiConfig: next });
+		                                onConfigChange(
+		                                  { novelAiConfig: next } as Partial<AppConfig>,
+		                                  { ...form.getFieldsValue(true), novelAiConfig: next } as AppConfig,
+		                                );
+		                              }}
+		                            />
+		                          );
+		                        }}
+		                      </Form.Item>
+
+		                      <Divider style={{ margin: '12px 0' }} />
+
+		                      <Text style={{ fontWeight: 600, color: '#8B5E34', display: 'block', marginBottom: 8 }}>自定义 JSON</Text>
+	                      <Form.Item
+	                        name="customJson"
+	                        extra={'可覆盖顶层字段或 parameters，例如 {"parameters":{"seed":1234}}'}
+	                        style={{ marginBottom: 0 }}
+	                      >
+	                        <Input.TextArea rows={4} placeholder='{"parameters": {"seed": 1234}}' />
+	                      </Form.Item>
+	                    </div>
+	                  ),
+	                },
+	              ]}
+	            />
+	          );
+	        }}
+	      </Form.Item>
 
       <div
         style={{

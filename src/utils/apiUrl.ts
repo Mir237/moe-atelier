@@ -8,7 +8,7 @@ import {
   resolveApiVersion as sharedResolveApiVersion,
 } from './providerRequests.mjs';
 
-export type ApiFormat = 'openai' | 'gemini' | 'vertex' | 'vertex-express' | 'novelai';
+export type ApiFormat = 'openai' | 'gemini' | 'vertex' | 'novelai';
 
 export const API_VERSION_OPTIONS = SHARED_API_VERSION_OPTIONS;
 
