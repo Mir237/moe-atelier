@@ -4,6 +4,7 @@ import {
   Space, Typography, Tooltip, Popover, InputNumber, Select, Modal
 } from 'antd';
 import type { TextAreaRef } from 'antd/es/input/TextArea';
+import type { InputRef } from 'antd/es/input';
 import { 
   UploadOutlined, DeleteFilled, ReloadOutlined, 
   BellFilled, BellOutlined, DownloadOutlined, PictureFilled,
@@ -71,16 +72,25 @@ import {
   mergeNovelAiConfig,
   stripEmptyNovelAiOverrides,
 } from '../utils/novelAiConfig';
+import {
+  formatDefaultTaskName,
+  MAX_TASK_NAME_LENGTH,
+  normalizeTaskName,
+} from '../utils/taskName';
 
 const { Text } = Typography;
 const { TextArea } = Input;
+const TASK_NAME_INPUT_MIN_WIDTH = 72;
+const TASK_NAME_INPUT_MAX_WIDTH = 160;
 
 interface ImageTaskProps {
   id: string;
+  name?: string;
   storageKey: string;
   config: AppConfig;
   backendMode: boolean;
   onRemove: () => void;
+  onNameChange?: (id: string, name?: string) => void;
   onStatsUpdate: (type: 'request' | 'success' | 'fail', duration?: number) => void;
   onCollect?: (item: CollectionItem) => void;
   collectionRevision?: number;
@@ -114,6 +124,7 @@ type CollectionRequestSnapshot = {
 };
 
 type BackendTaskSyncPayload = {
+  name: string;
   prompt: string;
   concurrency: number;
   enableSound: boolean;
@@ -136,6 +147,7 @@ const buildBackendTaskPatch = (
   if (!previous) return next;
   const patch: Partial<PersistedImageTaskState> = {};
   const keys: Array<keyof BackendTaskSyncPayload> = [
+    'name',
     'prompt',
     'concurrency',
     'enableSound',
@@ -240,7 +252,15 @@ const shouldDelayBackendResultTransition = (
   );
 };
 
-const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMode, onRemove, onStatsUpdate, onCollect, collectionRevision, dragAttributes, dragListeners }: ImageTaskProps) => {
+const ImageTask: React.FC<ImageTaskProps> = ({ id, name, storageKey, config, backendMode, onRemove, onNameChange, onStatsUpdate, onCollect, collectionRevision, dragAttributes, dragListeners }: ImageTaskProps) => {
+  const normalizedTaskName = normalizeTaskName(name);
+  const taskDisplayName = normalizedTaskName || formatDefaultTaskName(id);
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [draftName, setDraftName] = useState('');
+  const [nameInputWidth, setNameInputWidth] = useState<number>(TASK_NAME_INPUT_MIN_WIDTH);
+  const nameInputRef = useRef<InputRef | null>(null);
+  const nameTitleRef = useRef<HTMLSpanElement | null>(null);
+  const cancelNameEditRef = useRef(false);
   const [prompt, setPrompt] = useState('');
   const promptRef = useRef(prompt);
   const promptFocusedRef = useRef(false);
@@ -302,6 +322,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const backendPayload = React.useMemo<BackendTaskSyncPayload | null>(() => {
     if (!backendMode || !hydrated) return null;
     return {
+      name: normalizedTaskName || '',
       prompt,
       concurrency,
       enableSound,
@@ -311,7 +332,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 	      novelAiOverrides: stripEmptyNovelAiOverrides(novelAiOverrides),
 	      uploads: normalizeUploadsPayload(serializeUploads(fileList)) as PersistedUploadImage[],
 	    };
-	  }, [backendMode, hydrated, prompt, concurrency, enableSound, retryInterval, retryLimit, apiProfileId, novelAiOverrides, fileList]);
+	  }, [backendMode, hydrated, normalizedTaskName, prompt, concurrency, enableSound, retryInterval, retryLimit, apiProfileId, novelAiOverrides, fileList]);
   const taskSync = useDebouncedSync({
     enabled: backendMode && hydrated,
     payload: backendPayload,
@@ -346,6 +367,49 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
   const { markSynced: markTaskSynced } = taskSync;
   const uploadMessageKey = `task-image-upload-${id}`;
   const isUploadingImages = Object.keys(uploadProgressByUid).length > 0;
+
+  useEffect(() => {
+    if (!isEditingName) return;
+    window.setTimeout(() => {
+      nameInputRef.current?.focus();
+      nameInputRef.current?.select();
+    }, 0);
+  }, [isEditingName]);
+
+  const startNameEdit = () => {
+    if (backendMode && !hydrated) return;
+    const measuredWidth = nameTitleRef.current?.getBoundingClientRect().width;
+    const nextWidth =
+      typeof measuredWidth === 'number' && Number.isFinite(measuredWidth)
+        ? Math.max(
+            TASK_NAME_INPUT_MIN_WIDTH,
+            Math.min(TASK_NAME_INPUT_MAX_WIDTH, Math.ceil(measuredWidth)),
+          )
+        : TASK_NAME_INPUT_MIN_WIDTH;
+    cancelNameEditRef.current = false;
+    setNameInputWidth(nextWidth);
+    setDraftName(taskDisplayName);
+    setIsEditingName(true);
+  };
+
+  const commitNameEdit = () => {
+    if (cancelNameEditRef.current) {
+      cancelNameEditRef.current = false;
+      return;
+    }
+    const normalizedDraftName = normalizeTaskName(draftName);
+    const nextName =
+      normalizedDraftName === formatDefaultTaskName(id) ? undefined : normalizedDraftName;
+    setIsEditingName(false);
+    if (nextName === normalizedTaskName) return;
+    onNameChange?.(id, nextName);
+  };
+
+  const cancelNameEdit = () => {
+    cancelNameEditRef.current = true;
+    setDraftName(taskDisplayName);
+    setIsEditingName(false);
+  };
 
   const showUploadLoadingMessage = (count: number) => {
     activeUploadCountRef.current += count;
@@ -509,6 +573,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     stored: PersistedImageTaskState,
     options: { preserveUploads?: boolean; preservePrompt?: boolean } = {},
   ) => {
+    const nextName = normalizeTaskName(stored.name);
     const nextPrompt = stored.prompt ?? '';
     const currentPrompt = promptRef.current;
     const currentRetryInterval = retryIntervalRef.current;
@@ -531,6 +596,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     const shouldPreserveApiProfile =
       shouldPreserveApiProfileInput(nextApiProfileId, currentApiProfileId);
     const syncedTaskPayload: BackendTaskSyncPayload = {
+      name: nextName || '',
       prompt: nextPrompt,
       concurrency: nextConcurrency,
       enableSound: nextEnableSound,
@@ -542,6 +608,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 	    };
     backendSyncedTaskPayloadRef.current = syncedTaskPayload;
     markTaskSynced(syncedTaskPayload);
+    onNameChange?.(id, nextName);
 
     if (!shouldPreserveApiProfile) {
       apiProfileIdRef.current = nextApiProfileId;
@@ -808,6 +875,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
     const payload: PersistedImageTaskState = {
       ...(existing || {}),
       version: TASK_STATE_VERSION,
+      name: normalizedTaskName,
       prompt,
       concurrency,
       enableSound,
@@ -820,7 +888,7 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
 	      novelAiOverrides: stripEmptyNovelAiOverrides(novelAiOverrides),
 	    };
 	    saveTaskState(storageKey, payload);
-	  }, [prompt, concurrency, enableSound, retryInterval, retryLimit, results, stats, storageKey, hydrated, fileList, backendMode, apiProfileId, novelAiOverrides]);
+	  }, [normalizedTaskName, prompt, concurrency, enableSound, retryInterval, retryLimit, results, stats, storageKey, hydrated, fileList, backendMode, apiProfileId, novelAiOverrides]);
 
   useEffect(() => {
     if (!backendMode) return;
@@ -2351,7 +2419,71 @@ const ImageTask: React.FC<ImageTaskProps> = ({ id, storageKey, config, backendMo
           }}>
             <PictureFilled style={{ fontSize: 14 }} />
           </div>
-          <Text strong style={{ fontSize: 14, color: '#665555' }}>任务 #{id.slice(0, 6).toUpperCase()}</Text>
+          {isEditingName ? (
+            <Input
+              ref={nameInputRef}
+              className="task-name-input"
+              size="small"
+              value={draftName}
+              maxLength={MAX_TASK_NAME_LENGTH}
+              onChange={(event) => setDraftName(event.target.value)}
+              onBlur={commitNameEdit}
+              onPressEnter={(event) => {
+                event.preventDefault();
+                commitNameEdit();
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') {
+                  event.preventDefault();
+                  cancelNameEdit();
+                }
+              }}
+              disabled={backendTaskWaiting}
+              style={{
+                width: nameInputWidth,
+                minWidth: TASK_NAME_INPUT_MIN_WIDTH,
+                maxWidth: TASK_NAME_INPUT_MAX_WIDTH,
+                height: 32,
+                boxSizing: 'border-box',
+                fontSize: 12,
+                lineHeight: '28px',
+                fontWeight: 700,
+                color: '#665555',
+                background: '#FFF8FA',
+                border: '1px solid #FF8FA8',
+                borderRadius: 6,
+                padding: '0 3px',
+                boxShadow: '0 0 0 1px rgba(255, 143, 168, 0.18)',
+              }}
+            />
+          ) : (
+            <span
+              ref={nameTitleRef}
+              title={taskDisplayName}
+              onDoubleClick={startNameEdit}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                maxWidth: TASK_NAME_INPUT_MAX_WIDTH,
+                minWidth: 0,
+                cursor: backendTaskWaiting ? 'default' : 'text',
+                verticalAlign: 'middle',
+              }}
+            >
+              <Text
+                strong
+                style={{
+                  fontSize: 14,
+                  color: '#665555',
+                  maxWidth: '100%',
+                  display: 'inline-block',
+                }}
+                ellipsis
+              >
+                {taskDisplayName}
+              </Text>
+            </span>
+          )}
           <div 
             className={isGlobalLoading ? 'api-select-running' : ''}
             style={{

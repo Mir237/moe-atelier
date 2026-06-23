@@ -522,6 +522,33 @@ h1, h2, h3, h4, h5, h6, .ant-typography {
   color: #D0C0C0;
 }
 
+.task-name-input.ant-input {
+  padding: 0 !important;
+  text-indent: 0 !important;
+  overflow: hidden !important;
+  text-overflow: clip !important;
+  white-space: nowrap !important;
+  border: 2px solid #FF8FA8 !important;
+  border-radius: 999px !important;
+  background: linear-gradient(180deg, #FFFFFF 0%, #FFF8FA 100%) !important;
+  box-shadow:
+    0 0 0 4px #FFF0F3,
+    inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    inset 0 -1px 0 rgba(255, 183, 197, 0.22),
+    0 2px 6px rgba(255, 112, 144, 0.16) !important;
+  caret-color: #FF7090;
+}
+
+.task-name-input.ant-input:focus {
+  border-color: #FF7090 !important;
+  background: #FFFFFF !important;
+  box-shadow:
+    0 0 0 4px #FFE3EA,
+    inset 0 1px 0 rgba(255, 255, 255, 1),
+    inset 0 -1px 0 rgba(255, 143, 168, 0.24),
+    0 3px 8px rgba(255, 112, 144, 0.22) !important;
+}
+
 /* 萌系标签 */
 .moe-tag {
   background: #FFF0F3;

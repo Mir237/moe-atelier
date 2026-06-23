@@ -35,6 +35,7 @@ interface TaskGridProps {
   backendMode: boolean;
   collectionRevision: number;
   onRemoveTask: (id: string) => void;
+  onTaskNameChange: (id: string, name?: string) => void;
   onStatsUpdate: (type: 'request' | 'success' | 'fail', duration?: number) => void;
   onCollect: (item: CollectionItem) => void;
   onReorder: (nextTasks: TaskConfig[]) => void;
@@ -45,6 +46,7 @@ interface SortableTaskItemProps {
   config: AppConfig;
   backendMode: boolean;
   onRemove: (id: string) => void;
+  onTaskNameChange: (id: string, name?: string) => void;
   onStatsUpdate: (type: 'request' | 'success' | 'fail', duration?: number) => void;
   onCollect: (item: CollectionItem) => void;
   collectionRevision: number;
@@ -58,6 +60,7 @@ const SortableTaskItem = ({
   config,
   backendMode,
   onRemove,
+  onTaskNameChange,
   onStatsUpdate,
   onCollect,
   collectionRevision,
@@ -80,10 +83,12 @@ const SortableTaskItem = ({
       <div className="fade-in-up" style={{ height: '100%' }}>
         <ImageTask
           id={task.id}
+          name={task.name}
           storageKey={getTaskStorageKey(task.id)}
           config={config}
           backendMode={backendMode}
           onRemove={() => onRemove(task.id)}
+          onNameChange={onTaskNameChange}
           onStatsUpdate={onStatsUpdate}
           onCollect={onCollect}
           collectionRevision={collectionRevision}
@@ -101,6 +106,7 @@ const TaskGrid: React.FC<TaskGridProps> = ({
   backendMode,
   collectionRevision,
   onRemoveTask,
+  onTaskNameChange,
   onStatsUpdate,
   onCollect,
   onReorder,
@@ -196,6 +202,7 @@ const TaskGrid: React.FC<TaskGridProps> = ({
               config={config}
               backendMode={backendMode}
               onRemove={onRemoveTask}
+              onTaskNameChange={onTaskNameChange}
               onStatsUpdate={onStatsUpdate}
               onCollect={onCollect}
               collectionRevision={collectionRevision}
@@ -214,10 +221,12 @@ const TaskGrid: React.FC<TaskGridProps> = ({
           >
             <ImageTask
               id={activeId}
+              name={tasks.find((task) => task.id === activeId)?.name}
               storageKey={getTaskStorageKey(activeId)}
               config={config}
               backendMode={backendMode}
               onRemove={() => onRemoveTask(activeId)}
+              onNameChange={onTaskNameChange}
               onStatsUpdate={onStatsUpdate}
               collectionRevision={collectionRevision}
               dragAttributes={{}}

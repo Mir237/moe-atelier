@@ -50,6 +50,7 @@ export interface PersistedUploadImage {
 
 export interface PersistedImageTaskState {
   version: number;
+  name?: string;
   prompt: string;
   concurrency: number;
   enableSound: boolean;

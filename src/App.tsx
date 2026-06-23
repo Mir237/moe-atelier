@@ -67,6 +67,7 @@ import {
   deleteBackendTask,
   fetchBackendCollection,
   fetchBackendState,
+  fetchBackendTask,
   getBackendMode,
   getBackendToken,
   buildBackendStreamUrl,
@@ -77,6 +78,7 @@ import {
   setBackendToken,
   type BackendStateSnapshot,
 } from './utils/backendApi';
+import { normalizeTaskName } from './utils/taskName';
 
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
@@ -153,6 +155,7 @@ function App() {
   const [tasks, setTasks] = useState<TaskConfig[]>(() =>
     initialBackendMode ? [] : loadTasks(),
   );
+  const tasksRef = useRef<TaskConfig[]>(tasks);
   const [workspaceMode, setWorkspaceMode] = useState<'tasks' | 'workflow'>('tasks');
   const [workflowOpenProjectIds, setWorkflowOpenProjectIds] = useState<string[]>([]);
   const [workflowActiveProjectId, setWorkflowActiveProjectId] = useState<string | null>(null);
@@ -188,6 +191,9 @@ function App() {
   const backendCollectionHydratingRef = useRef(false);
   const backendCollectionSyncTimerRef = useRef<number | null>(null);
   const backendCollectionLastPayloadRef = useRef<string>('');
+  const backendTaskNamesRef = useRef<Record<string, string | undefined>>({});
+  const backendTaskNameLoadedRef = useRef<Set<string>>(new Set());
+  const backendTaskNameLoadingRef = useRef<Set<string>>(new Set());
   const collectedItemsRef = useRef(collectedItems);
   const collectionCountRef = useRef(collectedItems.length);
   const configGuard = useInputGuard({ idleMs: 700 });
@@ -216,6 +222,68 @@ function App() {
     shouldPreserve: shouldPreserveConfig,
   } = configGuard;
   const { markSynced: markConfigSynced } = configSync;
+
+  const applyTaskNameToCache = useCallback((taskId: string, value?: string) => {
+    const nextName = normalizeTaskName(value);
+    if (nextName) {
+      backendTaskNamesRef.current[taskId] = nextName;
+    } else {
+      delete backendTaskNamesRef.current[taskId];
+    }
+
+    setTasks((current) => {
+      let changed = false;
+      const nextTasks = current.map((task) => {
+        if (task.id !== taskId) return task;
+        const currentName = normalizeTaskName(task.name);
+        if (currentName === nextName) return task;
+        changed = true;
+        const nextTask: TaskConfig = { ...task };
+        if (nextName) {
+          nextTask.name = nextName;
+        } else {
+          delete nextTask.name;
+        }
+        return nextTask;
+      });
+      if (changed) {
+        tasksRef.current = nextTasks;
+        return nextTasks;
+      }
+      return current;
+    });
+  }, []);
+
+  const buildTasksFromOrder = useCallback((order: string[]) =>
+    order.map((id) => {
+      const cachedName =
+        backendTaskNamesRef.current[id] ||
+        normalizeTaskName(tasksRef.current.find((task) => task.id === id)?.name);
+      return {
+        id,
+        ...(cachedName ? { name: cachedName } : {}),
+        prompt: '',
+      };
+    }), []);
+
+  const hydrateBackendTaskNames = useCallback((ids: string[]) => {
+    ids.forEach((id) => {
+      if (backendTaskNameLoadedRef.current.has(id)) return;
+      if (backendTaskNameLoadingRef.current.has(id)) return;
+      backendTaskNameLoadingRef.current.add(id);
+      void fetchBackendTask(id)
+        .then((state) => {
+          backendTaskNameLoadedRef.current.add(id);
+          applyTaskNameToCache(id, state.name);
+        })
+        .catch((err) => {
+          console.warn('后端任务名称读取失败:', err);
+        })
+        .finally(() => {
+          backendTaskNameLoadingRef.current.delete(id);
+        });
+    });
+  }, [applyTaskNameToCache]);
 
   const applyBackendState = useCallback((state: BackendStateSnapshot) => {
       if (!backendModeRef.current) return;
@@ -266,14 +334,24 @@ function App() {
         }
       }
       const order = Array.isArray(state?.tasksOrder) ? state.tasksOrder : [];
-      setTasks(order.map((id) => ({ id, prompt: '' })));
+      const orderSet = new Set(order);
+      Object.keys(backendTaskNamesRef.current).forEach((id) => {
+        if (!orderSet.has(id)) delete backendTaskNamesRef.current[id];
+      });
+      backendTaskNameLoadedRef.current.forEach((id) => {
+        if (!orderSet.has(id)) backendTaskNameLoadedRef.current.delete(id);
+      });
+      const nextTasks = buildTasksFromOrder(order);
+      tasksRef.current = nextTasks;
+      setTasks(nextTasks);
+      hydrateBackendTaskNames(order);
       if (state?.globalStats) {
         setGlobalStats(state.globalStats);
       }
       window.setTimeout(() => {
         backendApplyingRef.current = false;
       }, 200);
-    }, [clearConfigDirty, markConfigSynced, shouldPreserveConfig]);
+    }, [buildTasksFromOrder, clearConfigDirty, hydrateBackendTaskNames, markConfigSynced, shouldPreserveConfig]);
 
   const bootstrapBackendState = useCallback(async () => {
     backendBootstrappingRef.current = true;
@@ -322,6 +400,9 @@ function App() {
       localHydratingRef.current = true;
       backendModeRef.current = false;
       setBackendModeState(false);
+      backendTaskNamesRef.current = {};
+      backendTaskNameLoadedRef.current.clear();
+      backendTaskNameLoadingRef.current.clear();
       const localConfig = loadConfig();
       persistedConfigRef.current = localConfig;
       setApiConfigDirty(false);
@@ -348,6 +429,9 @@ function App() {
     backendModeRef.current = false;
     backendBootstrappingRef.current = false;
     setBackendModeState(false);
+    backendTaskNamesRef.current = {};
+    backendTaskNameLoadedRef.current.clear();
+    backendTaskNameLoadingRef.current.clear();
     const localConfig = loadConfig();
     persistedConfigRef.current = localConfig;
     setApiConfigDirty(false);
@@ -366,6 +450,9 @@ function App() {
       const token = await authBackend(backendPassword);
       setBackendToken(token);
       persistBackendMode(true);
+      backendTaskNamesRef.current = {};
+      backendTaskNameLoadedRef.current.clear();
+      backendTaskNameLoadingRef.current.clear();
       setBackendModeState(true);
       backendModeRef.current = true;
       setBackendAuthPending(false);
@@ -390,6 +477,10 @@ function App() {
   React.useEffect(() => {
     configRef.current = config;
   }, [config]);
+
+  React.useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
 
   React.useEffect(() => {
     apiConfigDirtyRef.current = apiConfigDirty;
@@ -584,6 +675,10 @@ function App() {
       if (!backendModeRef.current) return;
       try {
         const payload = JSON.parse(event.data || '{}');
+        if (typeof payload?.taskId === 'string' && payload?.state) {
+          backendTaskNameLoadedRef.current.add(payload.taskId);
+          applyTaskNameToCache(payload.taskId, payload.state.name);
+        }
         window.dispatchEvent(new CustomEvent('backend-task-update', { detail: payload }));
       } catch (err) {
         console.warn('解析后端任务事件失败:', err);
@@ -612,7 +707,7 @@ function App() {
       source.removeEventListener('collection', handleCollection as EventListener);
       source.close();
     };
-  }, [backendMode, applyBackendState]);
+  }, [backendMode, applyBackendState, applyTaskNameToCache]);
 
   const fetchModels = async () => {
     const currentConfig = form.getFieldsValue();
@@ -724,8 +819,13 @@ function App() {
 		  };
 
   const handleReorderTasks = useCallback((nextTasks: TaskConfig[]) => {
+    tasksRef.current = nextTasks;
     setTasks(nextTasks);
   }, []);
+
+  const handleTaskNameChange = useCallback((id: string, name?: string) => {
+    applyTaskNameToCache(id, name);
+  }, [applyTaskNameToCache]);
 
   const handleCreateTaskFromPrompt = (prompt: string) => {
     const newTaskId = uuidv4();
@@ -1500,6 +1600,7 @@ function App() {
             backendMode={backendMode}
             collectionRevision={collectionRevision}
             onRemoveTask={handleRemoveTask}
+            onTaskNameChange={handleTaskNameChange}
             onStatsUpdate={updateGlobalStats}
 	            onCollect={handleCollect}
 	            onReorder={handleReorderTasks}

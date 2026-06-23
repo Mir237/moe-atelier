@@ -93,6 +93,7 @@ export interface AppConfig {
 
 export interface TaskConfig {
   id: string;
+  name?: string;
   prompt: string;
   imageUrl?: string;
 }

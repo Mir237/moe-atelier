@@ -7,6 +7,7 @@ import { safeStorageGet, safeStorageRemove, safeStorageSet } from '../utils/stor
 import { openImageDb, IMAGE_STORE_NAME } from '../utils/imageDb';
 import { buildPromptKey } from '../utils/prompt';
 import { coerceApiFormat } from '../utils/providerRequests.mjs';
+import { normalizeTaskName } from '../utils/taskName';
 
 export const STORAGE_KEYS = {
   config: 'moe-image-config',
@@ -452,6 +453,26 @@ export const loadGlobalStats = (): GlobalStats => {
   }
 };
 
+const loadCachedTaskName = (id: string) => {
+  const raw = safeStorageGet(`${TASK_STORAGE_PREFIX}${id}`, 'task cache');
+  if (!raw) return undefined;
+  try {
+    const data = JSON.parse(raw) as { name?: string };
+    return normalizeTaskName(data?.name);
+  } catch {
+    return undefined;
+  }
+};
+
+const createTaskConfig = (id: string): TaskConfig => {
+  const name = loadCachedTaskName(id);
+  return {
+    id,
+    ...(name ? { name } : {}),
+    prompt: '',
+  };
+};
+
 export const loadTasks = (): TaskConfig[] => {
   const raw = safeStorageGet(STORAGE_KEYS.tasks, 'app cache');
   if (!raw) return [{ id: uuidv4(), prompt: '' }];
@@ -466,7 +487,7 @@ export const loadTasks = (): TaskConfig[] => {
     if (uniqueIds.length === 0) {
       return [{ id: uuidv4(), prompt: '' }];
     }
-    return uniqueIds.map((id) => ({ id, prompt: '' }));
+    return uniqueIds.map(createTaskConfig);
   } catch (err) {
     console.warn('Failed to parse tasks cache:', err);
     return [{ id: uuidv4(), prompt: '' }];

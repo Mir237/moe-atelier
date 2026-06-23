@@ -99,6 +99,7 @@ import {
   mergeNovelAiConfig,
   stripEmptyNovelAiOverrides,
 } from '../utils/novelAiConfig';
+import { getTaskDisplayName } from '../utils/taskName';
 
 const { Text } = Typography;
 
@@ -664,9 +665,10 @@ export default function WorkflowBoard({
       ...tasks.map((task, index) => ({
         label: (() => {
           const owner = projects.find((project) => project.linkedTaskId === task.id);
-          if (!owner) return `任务 ${index + 1} · ${task.id.slice(0, 6).toUpperCase()}`;
-          if (owner.id === activeProjectId) return `任务 ${index + 1} · 当前绑定`;
-          return `任务 ${index + 1} · 已绑定「${owner.title}」`;
+          const taskLabel = `任务 ${index + 1} · ${getTaskDisplayName(task)}`;
+          if (!owner) return taskLabel;
+          if (owner.id === activeProjectId) return `${taskLabel} · 当前绑定`;
+          return `${taskLabel} · 已绑定「${owner.title}」`;
         })(),
         value: task.id,
       })),
@@ -944,7 +946,7 @@ export default function WorkflowBoard({
               ? await fetchBackendTask(task.id).catch(() => null)
               : loadTaskState(getTaskStorageKey(task.id));
             if (!stored?.workflow) continue;
-            const title = `任务 ${task.id.slice(0, 6).toUpperCase()} 工作流`;
+            const title = `${getTaskDisplayName({ id: task.id, name: stored.name || task.name })} 工作流`;
             if (backendMode) {
               migratedProjects.push(await createBackendWorkflowProject({
                 title,

@@ -98,6 +98,11 @@ const writeJsonFileAtomic = async (filePath, data) => {
 const coerceString = (value) => (typeof value === 'string' ? value : '')
 const coerceFiniteNumber = (value, fallback) =>
   typeof value === 'number' && Number.isFinite(value) ? value : fallback
+const MAX_TASK_NAME_LENGTH = 40
+export const normalizeTaskName = (value) => {
+  const trimmed = typeof value === 'string' ? value.trim() : ''
+  return trimmed ? trimmed.slice(0, MAX_TASK_NAME_LENGTH) : undefined
+}
 
 const WORKFLOW_NODE_TYPES = new Set(['text', 'image', 'config'])
 const WORKFLOW_STATUSES = new Set(['idle', 'loading', 'success', 'error'])
@@ -390,6 +395,7 @@ export const loadTaskState = async (taskId) => {
   return {
     ...createDefaultTaskState(),
     ...data,
+    name: normalizeTaskName(data?.name),
     concurrency: normalizeConcurrency(data?.concurrency),
     retryInterval: normalizeRetryInterval(data?.retryInterval),
     retryLimit: normalizeRetryLimit(data?.retryLimit),

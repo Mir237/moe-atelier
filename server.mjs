@@ -38,6 +38,7 @@ import {
   normalizeConcurrency,
   normalizeRetryInterval,
   normalizeRetryLimit,
+  normalizeTaskName,
   normalizeWorkflowState,
   listWorkflowProjects,
   saveBackendCollection,
@@ -1601,6 +1602,7 @@ app.put('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
     const next = {
       ...createDefaultTaskState(),
       ...payload,
+      name: normalizeTaskName(payload?.name),
       concurrency: normalizeConcurrency(payload?.concurrency),
       retryInterval: normalizeRetryInterval(payload?.retryInterval),
       retryLimit: normalizeRetryLimit(payload?.retryLimit),
@@ -1628,6 +1630,9 @@ app.patch('/api/backend/task/:id', requireBackendAuth, async (req, res) => {
     const current = (await loadTaskState(req.params.id)) || createDefaultTaskState()
     const next = {
       ...current,
+      name: Object.prototype.hasOwnProperty.call(payload, 'name')
+        ? normalizeTaskName(payload.name)
+        : current.name,
       prompt: typeof payload.prompt === 'string' ? payload.prompt : current.prompt,
       concurrency: normalizeConcurrency(payload?.concurrency, current.concurrency || DEFAULT_CONCURRENCY),
       enableSound: typeof payload.enableSound === 'boolean' ? payload.enableSound : current.enableSound,
