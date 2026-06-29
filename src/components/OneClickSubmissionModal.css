@@ -1,0 +1,509 @@
+.one-click-submission-modal .ant-modal-content {
+  border-radius: 20px;
+  overflow: hidden;
+  padding: 0;
+}
+
+.one-click-submission-modal .ant-modal-header {
+  padding: 24px 24px 16px;
+  border-bottom: 1px solid #FFF0F3;
+  margin-bottom: 0;
+}
+
+.one-click-submission-modal .ant-modal-body {
+  padding: 24px;
+}
+
+.one-click-submission-modal .ant-modal-footer {
+  padding: 16px 24px 24px;
+  border-top: 1px solid #FFF0F3;
+  margin-top: 0;
+}
+
+.one-click-submission-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.one-click-submission-title h4 {
+  margin: 0 0 4px;
+  color: #5D4037;
+}
+
+/* Select Step */
+.one-click-submission-select {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  height: 60vh;
+  min-height: 400px;
+}
+
+.one-click-submission-select-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #FFF9FA;
+  padding: 16px 20px;
+  border-radius: 16px;
+  border: 1px solid #FFE5EC;
+}
+
+.one-click-submission-select-head h5 {
+  margin: 0 0 4px;
+  color: #5D4037;
+}
+
+.one-click-submission-task-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px;
+  overflow-y: auto;
+  padding: 4px;
+  align-content: flex-start;
+}
+
+.one-click-submission-task-option {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+  border: 2px solid #FFF0F3;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 4px 12px rgba(255, 158, 181, 0.04);
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.one-click-submission-task-option:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 16px rgba(255, 158, 181, 0.1);
+  border-color: #FFE5EC;
+}
+
+.one-click-submission-task-option.is-selected {
+  border-color: #FF9EB5;
+  background: #FFF9FA;
+  box-shadow: 0 8px 16px rgba(255, 158, 181, 0.15);
+}
+
+.one-click-submission-task-index {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #FFE5EC;
+  color: #FF9EB5;
+  font-weight: bold;
+  font-size: 14px;
+  transition: all 0.3s;
+}
+
+.one-click-submission-task-option.is-selected .one-click-submission-task-index {
+  background: #FF9EB5;
+  color: #fff;
+}
+
+.one-click-submission-task-text {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 4px;
+}
+
+.one-click-submission-task-text strong {
+  color: #5D4037;
+  font-size: 15px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.one-click-submission-task-text small {
+  color: #8D6E63;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Edit Step */
+.one-click-submission-shell {
+  display: flex;
+  gap: 24px;
+  height: 65vh;
+  min-height: 480px;
+}
+
+.one-click-submission-nav {
+  width: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  padding-right: 8px;
+  flex-shrink: 0;
+}
+
+.one-click-submission-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+  background: #fff;
+  border: 2px solid #FFF0F3;
+  border-radius: 16px;
+  cursor: pointer;
+  transition: all 0.3s;
+  text-align: left;
+}
+
+.one-click-submission-nav-item:hover {
+  border-color: #FFE5EC;
+  background: #FFF9FA;
+}
+
+.one-click-submission-nav-item.is-active {
+  background: #FF9EB5;
+  border-color: #FF9EB5;
+  color: #fff;
+  box-shadow: 0 8px 16px rgba(255, 158, 181, 0.25);
+  transform: translateX(4px);
+}
+
+.one-click-submission-nav-index {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(255, 158, 181, 0.2);
+  color: #FF9EB5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: bold;
+  font-size: 13px;
+  transition: all 0.3s;
+  flex-shrink: 0;
+}
+
+.one-click-submission-nav-item.is-active .one-click-submission-nav-index {
+  background: #fff;
+  color: #FF9EB5;
+}
+
+.one-click-submission-nav-text {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.one-click-submission-nav-item.is-active .one-click-submission-nav-text strong,
+.one-click-submission-nav-item.is-active .one-click-submission-nav-text small {
+  color: #fff;
+}
+
+.one-click-submission-nav-text strong {
+  font-size: 14px;
+  color: #5D4037;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.one-click-submission-nav-text small {
+  font-size: 12px;
+  color: #8D6E63;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.one-click-submission-status-success {
+  color: #52c41a;
+  font-size: 16px;
+}
+.one-click-submission-nav-item.is-active .one-click-submission-status-success {
+  color: #fff;
+}
+
+.one-click-submission-status-error {
+  color: #ff4d4f;
+  font-size: 16px;
+}
+.one-click-submission-nav-item.is-active .one-click-submission-status-error {
+  color: #fff;
+}
+
+.one-click-submission-editor {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  overflow-y: auto;
+  padding: 0 16px 24px 0;
+}
+
+.one-click-submission-editor-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 16px;
+  border-bottom: 1px dashed #FFE5EC;
+}
+
+.one-click-submission-editor-head h5 {
+  margin: 4px 0 0 0;
+  font-size: 18px;
+  color: #5D4037;
+}
+
+.one-click-submission-alert {
+  border-radius: 12px;
+  border: none;
+}
+.one-click-submission-alert .ant-alert-description {
+  white-space: pre-line;
+}
+
+.one-click-submission-images {
+  background: #FFF9FA;
+  border: 1px solid #FFE5EC;
+  border-radius: 16px;
+  padding: 20px;
+}
+
+.one-click-submission-images-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.one-click-submission-image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.one-click-submission-upload-tile {
+  aspect-ratio: 1;
+  border: 2px dashed #FFC2D1;
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #FF9EB5;
+  background: #fff;
+  cursor: pointer;
+  transition: all 0.3s;
+  width: 100%;
+}
+
+.one-click-submission-upload-tile:hover {
+  background: #FFE5EC;
+  border-color: #FF9EB5;
+  transform: translateY(-2px);
+}
+
+.one-click-submission-upload-tile svg {
+  font-size: 24px;
+}
+
+.one-click-submission-image-item {
+  position: relative;
+  aspect-ratio: 1;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+  background: #fff;
+  border: 1px solid #FFE5EC;
+}
+
+.one-click-submission-image-item .ant-image,
+.one-click-submission-image-item .ant-image-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.one-click-submission-image-item .ant-btn {
+  position: absolute !important;
+  top: 8px;
+  right: 8px;
+  z-index: 10;
+  opacity: 0;
+  transition: opacity 0.3s;
+  background: rgba(255, 255, 255, 0.9);
+  border: none;
+}
+
+.one-click-submission-image-item:hover .ant-btn {
+  opacity: 1;
+}
+
+.one-click-submission-url-row {
+  display: flex;
+  gap: 12px;
+}
+
+.one-click-submission-url-row .ant-input-affix-wrapper {
+  flex: 1;
+  border-radius: 12px;
+}
+
+.one-click-submission-form-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 20px;
+}
+
+.one-click-submission-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.one-click-submission-field .ant-input,
+.one-click-submission-field .ant-select-selector {
+  border-radius: 12px !important;
+}
+
+.one-click-submission-note-field {
+  background: #FFFBE6;
+  border: 1px solid #FFE58F;
+  border-radius: 16px;
+  padding: 20px;
+}
+
+.one-click-submission-note-label {
+  color: #D48806;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 14px;
+}
+
+.one-click-submission-note-textarea {
+  border: 1px solid #FFE58F !important;
+  background: #FFFDF0 !important;
+  color: #D46B08 !important;
+  border-radius: 12px !important;
+}
+
+.one-click-submission-note-textarea:focus {
+  box-shadow: 0 0 0 2px rgba(250, 173, 20, 0.2) !important;
+}
+
+/* Mobile Adjustments */
+@media (max-width: 768px) {
+  .one-click-submission-modal {
+    top: 0 !important;
+    max-width: 100vw !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100vw !important;
+  }
+
+  .one-click-submission-modal .ant-modal-content {
+    height: 100dvh !important;
+    max-height: 100dvh !important;
+    border-radius: 0;
+    border: none;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .one-click-submission-modal .ant-modal-header,
+  .one-click-submission-modal .ant-modal-footer {
+    flex-shrink: 0;
+    margin: 0;
+  }
+
+  .one-click-submission-modal .ant-modal-body {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+  }
+
+  .one-click-submission-select {
+    height: 100%;
+    min-height: 0;
+  }
+
+  .one-click-submission-select-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .one-click-submission-task-list {
+    grid-template-columns: 1fr;
+    padding-bottom: 24px;
+  }
+
+  .one-click-submission-shell {
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    gap: 16px;
+  }
+
+  .one-click-submission-nav {
+    width: 100%;
+    flex-direction: row;
+    padding-right: 0;
+    padding-bottom: 8px;
+    border-right: none;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .one-click-submission-nav-item {
+    min-width: 220px;
+    padding: 12px;
+  }
+
+  .one-click-submission-nav-item.is-active {
+    transform: translateY(-4px);
+  }
+
+  .one-click-submission-editor {
+    padding-right: 0;
+    padding-bottom: 32px;
+  }
+
+  .one-click-submission-form-grid,
+  .one-click-submission-url-row {
+    grid-template-columns: 1fr;
+  }
+
+  .one-click-submission-url-row {
+    flex-direction: column;
+  }
+
+  .one-click-submission-footer {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .one-click-submission-footer .ant-space {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+}

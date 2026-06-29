@@ -2,13 +2,13 @@ import * as React from 'react';
 import { useState, useCallback, useRef } from 'react';
 import { Layout, Button, Form, Row, Col, Typography, Space, ConfigProvider, message, Tooltip, Segmented } from 'antd';
 import { 
-  PlusOutlined, 
   SettingFilled, 
   ThunderboltFilled, 
   CheckCircleFilled, 
   HeartFilled,
   AppstoreFilled,
   BranchesOutlined,
+  CloudUploadOutlined,
   DeleteFilled,
   RocketFilled,
   HourglassFilled,
@@ -18,6 +18,7 @@ import {
 import { v4 as uuidv4 } from 'uuid';
 import PromptDrawer from './components/PromptDrawer';
 import CollectionBox from './components/CollectionBox';
+import OneClickSubmissionModal from './components/OneClickSubmissionModal';
 import TaskGrid from './components/TaskGrid';
 import ConfigDrawer from './components/ConfigDrawer';
 import WorkflowBoard from './components/WorkflowBoard';
@@ -167,6 +168,7 @@ function App() {
   );
   const [collectionRevision, setCollectionRevision] = useState(0);
   const [promptDrawerVisible, setPromptDrawerVisible] = useState(false);
+  const [submissionModalOpen, setSubmissionModalOpen] = useState(false);
   const [models, setModels] = useState<{label: string, value: string}[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [form] = Form.useForm();
@@ -1359,84 +1361,98 @@ function App() {
             </div>
           </div>
 
-	          <Space size={8} className="header-actions">
-	            <Segmented
-	              className="workspace-mode-switch"
-	              value={workspaceMode}
-	              onChange={(value) => setWorkspaceMode(value as 'tasks' | 'workflow')}
-	              options={[
-	                {
-	                  value: 'tasks',
-	                  label: (
-	                    <span className="workspace-mode-label">
-	                      <AppstoreFilled />
-	                      任务卡
-	                    </span>
-	                  ),
-	                },
-	                {
-	                  value: 'workflow',
-	                  label: (
-	                    <span className="workspace-mode-label">
-	                      <BranchesOutlined />
-	                      工作流
-	                    </span>
-	                  ),
-	                },
-	              ]}
-	            />
-	            <Tooltip title="提示词广场">
-	              <Button
+          <div className="header-actions">
+            <Segmented
+              className="workspace-mode-switch mobile-hidden"
+              value={workspaceMode}
+              onChange={(value) => setWorkspaceMode(value as 'tasks' | 'workflow')}
+              options={[
+                {
+                  value: 'tasks',
+                  label: (
+                    <span className="workspace-mode-label">
+                      <AppstoreFilled />
+                      任务卡
+                    </span>
+                  ),
+                },
+                {
+                  value: 'workflow',
+                  label: (
+                    <span className="workspace-mode-label">
+                      <BranchesOutlined />
+                      工作流
+                    </span>
+                  ),
+                },
+              ]}
+            />
+            <Tooltip title="提示词广场">
+              <Button
                 icon={<AppstoreFilled />}
                 onClick={() => setPromptDrawerVisible(true)}
                 size="large"
                 className="mobile-hidden"
-                style={{ 
-                  background: 'rgba(255,255,255,0.6)', 
+                style={{
+                  background: 'rgba(255,255,255,0.6)',
                   border: '1px solid #FF9EB5',
-                  color: '#FF9EB5' 
+                  color: '#FF9EB5',
                 }}
               >
                 广场
               </Button>
             </Tooltip>
-              <Button
-                icon={<AppstoreFilled />}
-                onClick={() => setPromptDrawerVisible(true)}
-                size="large"
-                shape="circle"
-                className="desktop-hidden circle-icon-btn"
-                style={{ 
-                  background: 'rgba(255,255,255,0.6)', 
-                  border: '1px solid #FF9EB5',
-                  color: '#FF9EB5' 
-                }}
+            <Button
+              icon={<AppstoreFilled />}
+              onClick={() => setPromptDrawerVisible(true)}
+              size="large"
+              shape="circle"
+              aria-label="提示词广场"
+              className="desktop-hidden circle-icon-btn"
+              style={{
+                background: 'rgba(255,255,255,0.6)',
+                border: '1px solid #FF9EB5',
+                color: '#FF9EB5',
+              }}
             />
-            
-            <Button 
-              icon={<SettingFilled />} 
+
+            <Button
+              icon={<SettingFilled />}
               onClick={() => setConfigVisible(true)}
               size="large"
               className="mobile-hidden"
             >
               系统配置
             </Button>
-            <Button 
-              icon={<SettingFilled />} 
+            <Button
+              icon={<SettingFilled />}
               onClick={() => setConfigVisible(true)}
               size="large"
               shape="circle"
+              aria-label="系统配置"
               className="desktop-hidden circle-icon-btn"
             />
-            <Button 
-              type="primary" 
-              icon={<PlusOutlined />} 
+            <Button
+              type="primary"
+              icon={<span className="thick-plus-icon" aria-hidden="true" />}
               onClick={handleAddTask}
               size="large"
+              className="mobile-hidden"
             >
               新建任务
             </Button>
-          </Space>
+            <Tooltip title="新建任务">
+              <Button
+                type="primary"
+                icon={<span className="thick-plus-icon" aria-hidden="true" />}
+                onClick={handleAddTask}
+                size="large"
+                shape="circle"
+                aria-label="新建任务"
+                className="desktop-hidden circle-icon-btn mobile-new-task-btn"
+              />
+            </Tooltip>
+          </div>
         </Header>
 
 	        <Content
@@ -1581,17 +1597,40 @@ function App() {
           </div>
 
           {/* 任务列表 */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, paddingLeft: 4 }}>
-            <div style={{ 
-              width: 24, height: 24, borderRadius: '50%', background: '#FF9EB5', 
-              display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff',
-              fontSize: 12, fontWeight: 700
-            }}>
-              {tasks.length}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+              flexWrap: 'wrap',
+              marginBottom: 16,
+              paddingLeft: 4,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div style={{
+                width: 24, height: 24, borderRadius: '50%', background: '#FF9EB5',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff',
+                fontSize: 12, fontWeight: 700
+              }}>
+                {tasks.length}
+              </div>
+              <Text style={{ fontSize: 18, fontWeight: 800, color: '#665555' }}>
+                进行中的任务
+              </Text>
             </div>
-            <Text style={{ fontSize: 18, fontWeight: 800, color: '#665555' }}>
-              进行中的任务
-            </Text>
+            <Space size={8} wrap>
+              <Button
+                type="primary"
+                size="small"
+                icon={<CloudUploadOutlined />}
+                disabled={tasks.length === 0}
+                onClick={() => setSubmissionModalOpen(true)}
+              >
+                一键投稿
+              </Button>
+            </Space>
           </div>
 
           <TaskGrid
@@ -1602,9 +1641,9 @@ function App() {
             onRemoveTask={handleRemoveTask}
             onTaskNameChange={handleTaskNameChange}
             onStatsUpdate={updateGlobalStats}
-	            onCollect={handleCollect}
-	            onReorder={handleReorderTasks}
-	          />
+            onCollect={handleCollect}
+            onReorder={handleReorderTasks}
+          />
 	          </>
 	          )}
 	        </Content>
@@ -1627,6 +1666,13 @@ function App() {
             onCreateTask={handleCreateTaskFromCollection}
           />
         )}
+
+        <OneClickSubmissionModal
+          open={submissionModalOpen}
+          tasks={tasks}
+          backendMode={backendMode}
+          onClose={() => setSubmissionModalOpen(false)}
+        />
 
         <ConfigDrawer
           visible={configVisible}

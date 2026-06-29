@@ -1409,6 +1409,96 @@ void cleanupOrphanedImages().catch((err) => {
 
 const backendTokens = new Set()
 const PROMPT_MANAGER_URL = 'https://prompt.vioaki.xyz/api/gallery'
+const NANOBANANA_SUBMIT_ENDPOINTS = [
+  'https://nanobanana-website.vercel.app/api/submit',
+  'https://bmzxdlj.cn/api/submit',
+]
+const CATBOX_UPLOAD_URL = 'https://catbox.moe/user/api.php'
+
+const readNanobananaJson = async (response) => {
+  const text = await response.text()
+  if (!text) return {}
+  try {
+    return JSON.parse(text)
+  } catch {
+    return { success: false, error: text }
+  }
+}
+
+const postNanobananaSubmission = async (payload) => {
+  let lastError = null
+
+  for (const endpoint of NANOBANANA_SUBMIT_ENDPOINTS) {
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          Connection: 'close',
+        },
+        body: JSON.stringify(payload),
+      })
+      const body = await readNanobananaJson(response)
+      if (response.ok || response.status < 500) {
+        return { status: response.status, body }
+      }
+      lastError = body?.error || response.statusText || `HTTP ${response.status}`
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err)
+    }
+  }
+
+  return {
+    status: 502,
+    body: {
+      success: false,
+      error: lastError || '投稿服务暂不可用',
+    },
+  }
+}
+
+const parseBase64ImagePayload = (value) => {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+
+  const match = trimmed.match(/^data:([^;]+);base64,(.*)$/)
+  const mime = match?.[1] || 'image/png'
+  const base64 = match ? match[2] : trimmed
+  const cleanBase64 = base64.replace(/\s+/g, '')
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleanBase64) || cleanBase64.length % 4 === 1) {
+    return null
+  }
+  const buffer = Buffer.from(cleanBase64, 'base64')
+  if (!buffer.length) return null
+  return { mime, buffer }
+}
+
+const resolveCatboxFileName = (mime = 'image/png') => {
+  const ext = imageExtensionFromMime(mime).replace('.', '') || 'png'
+  return `moe-atelier-${Date.now()}.${ext}`
+}
+
+const uploadBufferToCatbox = async ({ buffer, mime }) => {
+  const formData = new FormData()
+  formData.append('reqtype', 'fileupload')
+  formData.append(
+    'fileToUpload',
+    new Blob([buffer], { type: mime }),
+    resolveCatboxFileName(mime),
+  )
+
+  const response = await fetch(CATBOX_UPLOAD_URL, {
+    method: 'POST',
+    body: formData,
+  })
+  const text = (await response.text()).trim()
+  if (response.ok && /^https?:\/\//i.test(text)) {
+    return text
+  }
+  throw new Error(text || response.statusText || '图片上传失败')
+}
 
 app.get('/api/prompt-manager', async (_req, res) => {
   try {
@@ -1425,6 +1515,37 @@ app.get('/api/prompt-manager', async (_req, res) => {
   } catch (err) {
     console.error('prompt-manager proxy error:', err)
     res.status(500).json({ error: 'Proxy Error' })
+  }
+})
+
+app.post('/api/nanobanana/submit', async (req, res) => {
+  try {
+    const result = await postNanobananaSubmission(req.body || {})
+    res.status(result.status).json(result.body)
+  } catch (err) {
+    console.error('nanobanana submit proxy error:', err)
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : '投稿代理失败',
+    })
+  }
+})
+
+app.post('/api/nanobanana/upload-image', async (req, res) => {
+  try {
+    const parsed = parseBase64ImagePayload(req.body?.image)
+    if (!parsed) {
+      res.status(400).json({ success: false, error: '没有收到可上传的图片' })
+      return
+    }
+    const url = await uploadBufferToCatbox(parsed)
+    res.json({ success: true, url })
+  } catch (err) {
+    console.error('nanobanana image upload proxy error:', err)
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : '图片上传失败',
+    })
   }
 })
 

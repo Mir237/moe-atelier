@@ -149,6 +149,114 @@ body {
   cursor: grabbing;
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /* 通用卡片样式 */
 .moe-card {
   background: var(--c-bg-card);
@@ -1778,6 +1886,13 @@ h1, h2, h3, h4, h5, h6, .ant-typography {
   padding: 0 24px !important;
 }
 
+.header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
 .header-actions .ant-btn {
   display: inline-flex;
   align-items: center;
@@ -1847,11 +1962,6 @@ h1, h2, h3, h4, h5, h6, .ant-typography {
     gap: 8px !important; /* 在移动端稍微减小按钮间距 */
   }
 
-  .header-actions > .ant-space-item:nth-child(1),
-  .header-actions > .ant-space-item:nth-child(3) {
-    display: none;
-  }
-
   .stat-panel {
     padding: 12px;
   }
@@ -1859,6 +1969,34 @@ h1, h2, h3, h4, h5, h6, .ant-typography {
   .stat-value {
     font-size: 20px;
   }
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
   
   .ant-drawer-content-wrapper {
     width: 100% !important;
@@ -1912,6 +2050,39 @@ h1, h2, h3, h4, h5, h6, .ant-typography {
 
 .mobile-icon-btn.ant-btn .ant-btn-icon > * {
   display: block;
+}
+
+.mobile-new-task-btn.ant-btn .ant-btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+
+.thick-plus-icon {
+  position: relative;
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  color: inherit;
+}
+
+.thick-plus-icon::before,
+.thick-plus-icon::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 18px;
+  height: 3px;
+  border-radius: 999px;
+  background: currentColor;
+  transform: translate(-50%, -50%);
+}
+
+.thick-plus-icon::after {
+  width: 3px;
+  height: 18px;
 }
 
 /* Keep AutoComplete height driven by the custom Input */
